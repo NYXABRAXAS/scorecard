@@ -37,6 +37,16 @@ app.use(rateLimit({ windowMs: env.rateLimit.windowMs, max: env.rateLimit.max, st
 
 app.get('/health', (req, res) => res.json({ success: true, data: { status: 'UP', time: new Date().toISOString() } }));
 
+app.get('/', (req, res) => res.json({
+  success: true,
+  data: {
+    service: 'MCF LOS — Score Card API',
+    docs: '/docs',
+    health: '/health',
+    apiPrefix: '/api/v1'
+  }
+}));
+
 try {
   const openapiDocument = YAML.load(path.join(__dirname, '..', 'openapi.yaml'));
   app.use('/docs', swaggerUi.serve, swaggerUi.setup(openapiDocument));
