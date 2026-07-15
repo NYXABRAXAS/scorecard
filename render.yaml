@@ -1,0 +1,49 @@
+databases:
+  - name: mcf-scorecard-db
+    plan: free
+    databaseName: mcf_scorecard
+    user: mcf_scorecard_user
+
+services:
+  - type: web
+    name: mcf-scorecard-api
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_ACCESS_TTL
+        value: 15m
+      - key: JWT_REFRESH_TTL
+        value: 7d
+      - key: RATE_LIMIT_WINDOW_MS
+        value: "60000"
+      - key: RATE_LIMIT_MAX
+        value: "120"
+      - key: DB_HOST
+        fromDatabase:
+          name: mcf-scorecard-db
+          property: host
+      - key: DB_PORT
+        fromDatabase:
+          name: mcf-scorecard-db
+          property: port
+      - key: DB_NAME
+        fromDatabase:
+          name: mcf-scorecard-db
+          property: database
+      - key: DB_USER
+        fromDatabase:
+          name: mcf-scorecard-db
+          property: user
+      - key: DB_PASSWORD
+        fromDatabase:
+          name: mcf-scorecard-db
+          property: password
+      - key: DB_SSL
+        value: "true"
