@@ -73,6 +73,13 @@ const service = {
     }
 
     const id = await repository.create({ ...input, createdBy: actor.id });
+
+    // Compute the initial segment/score/guard preview immediately, so the create
+    // response already reflects real numbers instead of all-null/default-zero
+    // placeholders that only a subsequent /validate or /recalculate would fill in.
+    const { computed } = await buildComputedForCard(id);
+    await repository.applyComputedScores(id, computed);
+
     await repository.insertVersionSnapshot({
       scoreCardId: id, version: 1, status: 'DRAFT',
       snapshot: await repository.findById(id), changeReason: 'CREATE', changedBy: actor.id
