@@ -4,8 +4,10 @@ info:
   version: "1.0.0"
   description: >
     REST API for the Score Card module of the MCF Prize-Money-Against-Security Loan
-    Origination System. Implements the Risk-Assessment Scoring Engine (Annexure 2)
-    exactly — see DOCUMENTATION.md for the full business-rule reference.
+    Origination System. Implements a 6-factor scoring model (CIBIL Score, Income-EMI
+    Coverage, Security Coverage/LTV, DPD History, Enquiry Count, Guarantor Quality)
+    plus the FRD-grounded security valuation formula — see DOCUMENTATION.md for the
+    full business-rule reference.
   contact:
     name: MCF LOS Engineering
 servers:
@@ -90,19 +92,21 @@ paths:
               chitValue: 6750000
               futureLiability: 6000000
               documentsComplete: true
+              grossMonthlyIncome: 35000
+              existingObligations: 5000
+              proposedEmi: 12000
               subscriber:
                 name: Meena Devi Nair
                 employmentType: Salaried-Govt
-                foir: 0.29
                 creditScore: 763
-                customerVintageYears: 4
+                worstDpdDays: 0
+                enquiryCount6Months: 1
               guarantors:
                 - name: Sundar Meenakshisundaram
                   employmentType: Business
                   entityType: Proprietorship
-                  staffCount: 4
-                  foir: 0.22
                   creditScore: 809
+                  grossIncome: 28000
               securities:
                 - securityType: Chit Passbook
                   holderName: Kalaivani Natarajan
@@ -131,9 +135,9 @@ paths:
         - name: status
           in: query
           schema: { $ref: '#/components/schemas/Status' }
-        - name: riskGrade
+        - name: eligible
           in: query
-          schema: { type: string, enum: [A, B, C, D] }
+          schema: { type: boolean }
         - name: applicationId
           in: query
           schema: { type: string }
@@ -512,30 +516,20 @@ components:
 
     Person:
       type: object
-      required: [name, employmentType, foir]
+      required: [name, employmentType]
+      description: >
+        creditScore, worstDpdDays and enquiryCount6Months are bureau-fetched fields
+        (CIBIL/credit-bureau report pull) — meant to be populated by an upstream
+        bureau integration, not typed in manually. See DOCUMENTATION.md Section 5.6.
       properties:
         name: { type: string }
         employmentType: { type: string, enum: [Salaried-Govt, Salaried-PSU, Salaried-Private, Business, "Self Employed - Professional", Agriculture, Other] }
         entityType: { type: string, enum: [PvtLtd, Partnership, Proprietorship], nullable: true }
-        yearsInBusiness: { type: number }
-        yearsOfService: { type: number }
-        employeeCount: { type: integer }
-        staffCount: { type: integer }
-        permanentGovt: { type: boolean }
-        customerVintageYears: { type: number }
-        personalVisits: { type: integer, default: 0 }
-        propertyCount: { type: integer, default: 0 }
-        propertyValue: { type: number, default: 0 }
-        creditScore: { type: integer, minimum: 300, maximum: 900, nullable: true }
-        foir: { type: number, minimum: 0, maximum: 3 }
+        creditScore: { type: integer, minimum: 300, maximum: 900, nullable: true, description: "Bureau-fetched" }
+        worstDpdDays: { type: integer, minimum: 0, nullable: true, description: "Bureau-fetched; null/0 = clean" }
+        enquiryCount6Months: { type: integer, minimum: 0, nullable: true, description: "Bureau-fetched" }
         grossIncome: { type: number }
         netIncome: { type: number }
-        directExposure: { type: number, default: 0 }
-        indirectExposure: { type: number, default: 0 }
-        suitFiled: { type: boolean, default: false }
-        prlFlag: { type: boolean, default: false }
-        cc3Flag: { type: boolean, default: false }
-        chequeBounceCount: { type: integer, default: 0 }
 
     Security:
       type: object
@@ -544,7 +538,7 @@ components:
         `valueLoaded` (the Accepted Value) is ALWAYS server-computed from the
         type-specific raw input fields below, per the FRD Section 6.1 Accepted Value
         Formula table — it is never accepted as raw client input. Which raw fields
-        are required depends on `securityType`; see DOCUMENTATION.md Section 5.7.
+        are required depends on `securityType`; see DOCUMENTATION.md Section 5.6.
       properties:
         securityType:
           type: string
@@ -565,14 +559,17 @@ components:
 
     CreateScoreCardRequest:
       type: object
-      required: [applicationId, chitValue, futureLiability, subscriber, securities]
+      required: [applicationId, chitValue, futureLiability, grossMonthlyIncome, proposedEmi, subscriber, securities]
       properties:
         applicationId: { type: string, pattern: '^MCF-\d{4}-\d{6}$' }
-        chitValue: { type: number, minimum: 0.01 }
+        chitValue: { type: number, minimum: 0.01, description: "Also treated as the proposed loan amount for Security Coverage" }
         futureLiability: { type: number, minimum: 0.01 }
         documentsComplete: { type: boolean, default: false }
+        grossMonthlyIncome: { type: number, minimum: 0, description: "Income-EMI Coverage input" }
+        existingObligations: { type: number, minimum: 0, default: 0 }
+        proposedEmi: { type: number, minimum: 0 }
         subscriber: { $ref: '#/components/schemas/Person' }
-        guarantors: { type: array, items: { $ref: '#/components/schemas/Person' }, maxItems: 4 }
+        guarantors: { type: array, items: { $ref: '#/components/schemas/Person' }, maxItems: 4, description: "Only the first guarantor feeds Guarantor Quality — see DOCUMENTATION.md Section 6 Assumptions" }
         securities: { type: array, items: { $ref: '#/components/schemas/Security' }, minItems: 1 }
 
     UpdateScoreCardRequest:
@@ -581,38 +578,36 @@ components:
         chitValue: { type: number }
         futureLiability: { type: number }
         documentsComplete: { type: boolean }
+        grossMonthlyIncome: { type: number }
+        existingObligations: { type: number }
+        proposedEmi: { type: number }
         subscriber: { $ref: '#/components/schemas/Person' }
         guarantors: { type: array, items: { $ref: '#/components/schemas/Person' } }
         securities: { type: array, items: { $ref: '#/components/schemas/Security' } }
         remarks: { type: string, maxLength: 2000 }
 
-    PersonScore:
+    ScoreFactor:
       type: object
       properties:
-        positive: { type: number }
-        negative: { type: number }
-        final: { type: number }
-
-    Segment:
-      type: object
-      properties:
-        category: { type: string, enum: [secured, unsecured] }
-        bucket: { type: string }
-        method: { type: string, enum: [simple, moderate, comprehensive] }
+        score: { type: number }
+        max: { type: number }
 
     ScoreCardScores:
       type: object
+      description: >
+        The 6-factor Score Card model — see DOCUMENTATION.md Section 6 for each
+        factor's exact band definition. These bands are engineering defaults
+        pending Client confirmation.
       properties:
-        sbPositiveScore: { type: number, nullable: true }
-        sbNegativeScore: { type: number, nullable: true }
-        sbFinalScore: { type: number, nullable: true }
-        avgGuarantorScore: { type: number }
-        sbWeightage: { type: number, example: 0.6 }
-        guarantorWeightage: { type: number, example: 0.4 }
-        finalWeightedScore: { type: number, nullable: true }
-        riskGrade: { type: string, enum: [A, B, C, D], nullable: true }
-        riskLabel: { type: string, nullable: true }
-        decisionText: { type: string, nullable: true }
+        cibilFactorScore: { type: number, nullable: true, description: "max 20" }
+        incomeEmiScore: { type: number, nullable: true, description: "max 20" }
+        securityCoverageScore: { type: number, nullable: true, description: "max 15" }
+        dpdHistoryScore: { type: number, nullable: true, description: "max 20" }
+        enquiryCountScore: { type: number, nullable: true, description: "max 15" }
+        guarantorQualityScore: { type: number, nullable: true, description: "max 10" }
+        totalScore: { type: number, nullable: true, description: "sum of the 6 factors, max 100" }
+        eligible: { type: boolean, nullable: true, description: "totalScore >= 75" }
+        decisionText: { type: string, nullable: true, enum: ["Eligible for Approval", "Conditional - Manual Review Required", "Not Eligible"] }
 
     ScoreCard:
       type: object
@@ -621,13 +616,15 @@ components:
         applicationId: { type: string }
         version: { type: integer }
         status: { $ref: '#/components/schemas/Status' }
-        segment: { $ref: '#/components/schemas/Segment' }
         chitValue: { type: number }
         futureLiability: { type: number }
         securityTotalValue: { type: number }
         documentsComplete: { type: boolean }
         securityCoversLiability: { type: boolean }
         cibilComplete: { type: boolean }
+        grossMonthlyIncome: { type: number }
+        existingObligations: { type: number }
+        proposedEmi: { type: number }
         scores: { $ref: '#/components/schemas/ScoreCardScores' }
         subscriber: { $ref: '#/components/schemas/Person' }
         guarantors: { type: array, items: { $ref: '#/components/schemas/Person' } }
@@ -653,10 +650,17 @@ components:
       properties:
         applicationId: { type: string }
         status: { $ref: '#/components/schemas/Status' }
-        segment: { $ref: '#/components/schemas/Segment' }
-        finalWeightedScore: { type: number, nullable: true }
-        riskGrade: { type: string, nullable: true }
-        riskLabel: { type: string, nullable: true }
+        factors:
+          type: object
+          properties:
+            cibilFactorScore: { type: number, nullable: true }
+            incomeEmiScore: { type: number, nullable: true }
+            securityCoverageScore: { type: number, nullable: true }
+            dpdHistoryScore: { type: number, nullable: true }
+            enquiryCountScore: { type: number, nullable: true }
+            guarantorQualityScore: { type: number, nullable: true }
+        totalScore: { type: number, nullable: true }
+        eligible: { type: boolean, nullable: true }
         decisionText: { type: string, nullable: true }
         readyToSubmit: { type: boolean }
         guardStatus:

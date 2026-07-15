@@ -49,7 +49,10 @@ async function buildComputedForCard(scoreCardId) {
     securities,
     chitValue: card.chitValue,
     futureLiability: card.futureLiability,
-    documentsComplete: card.documentsComplete
+    documentsComplete: card.documentsComplete,
+    grossMonthlyIncome: card.grossMonthlyIncome,
+    existingObligations: card.existingObligations,
+    proposedEmi: card.proposedEmi
   });
   return { card, persons, securities, computed };
 }
@@ -306,10 +309,16 @@ const service = {
     return {
       applicationId: card.applicationId,
       status: card.status,
-      segment: card.segment,
-      finalWeightedScore: card.scores.finalWeightedScore,
-      riskGrade: card.scores.riskGrade,
-      riskLabel: card.scores.riskLabel,
+      factors: {
+        cibilFactorScore: card.scores.cibilFactorScore,
+        incomeEmiScore: card.scores.incomeEmiScore,
+        securityCoverageScore: card.scores.securityCoverageScore,
+        dpdHistoryScore: card.scores.dpdHistoryScore,
+        enquiryCountScore: card.scores.enquiryCountScore,
+        guarantorQualityScore: card.scores.guarantorQualityScore
+      },
+      totalScore: card.scores.totalScore,
+      eligible: card.scores.eligible,
       decisionText: card.scores.decisionText,
       readyToSubmit: card.documentsComplete && card.securityCoversLiability && card.cibilComplete,
       guardStatus: {

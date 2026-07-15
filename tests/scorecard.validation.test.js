@@ -4,7 +4,7 @@ const {
   createScoreCardSchema, updateScoreCardSchema, rejectSchema, documentUploadSchema, idParamSchema
 } = require('../src/modules/scorecard/scorecard.validation');
 
-const validSubscriber = { name: 'Ramesh Gopalakrishnan', employmentType: 'Salaried-Private', foir: 0.3, employeeCount: 50 };
+const validSubscriber = { name: 'Ramesh Gopalakrishnan', employmentType: 'Salaried-Private', creditScore: 748 };
 const validSecurity = { securityType: 'Gold Ornaments', netWeightGrams: 150, ratePerGram: 6000 };
 
 function baseValidPayload(overrides = {}) {
@@ -13,6 +13,9 @@ function baseValidPayload(overrides = {}) {
     chitValue: 1000000,
     futureLiability: 800000,
     documentsComplete: true,
+    grossMonthlyIncome: 50000,
+    existingObligations: 5000,
+    proposedEmi: 8000,
     subscriber: validSubscriber,
     guarantors: [],
     securities: [validSecurity],

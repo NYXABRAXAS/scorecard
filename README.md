@@ -1,8 +1,9 @@
 # MCF LOS — Score Card API
 
 REST API for the Score Card module of the MCF Prize-Money-Against-Security Loan
-Origination System — subscriber/guarantor credit risk scoring per the Risk-Assessment
-Scoring Engine (Annexure 2), with a full Draft → Validate → Submit → Approve/Reject
+Origination System — subscriber/guarantor credit risk scoring via a 6-factor model
+(CIBIL Score, Income-EMI Coverage, Security Coverage, DPD History, Enquiry Count,
+Guarantor Quality), with a full Draft → Validate → Submit → Approve/Reject
 lifecycle, audit trail, and version history.
 
 **Full technical documentation: [DOCUMENTATION.md](DOCUMENTATION.md)**
@@ -41,7 +42,7 @@ curl -X POST http://localhost:4000/api/v1/auth/login \
 npm test
 ```
 
-155 tests (81 calculation-engine + 19 security-valuation + 20 validation-schema +
+119 tests (45 calculation-engine + 19 security-valuation + 20 validation-schema +
 35 API integration tests), all runnable against a real PostgreSQL instance — see
 [DOCUMENTATION.md §14](DOCUMENTATION.md#14-test-cases).
 

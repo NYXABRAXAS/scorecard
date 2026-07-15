@@ -8,7 +8,15 @@ const EMPLOYMENT_TYPES = [
 ];
 const ENTITY_TYPES = ['PvtLtd', 'Partnership', 'Proprietorship'];
 
-/** One subscriber/guarantor person — see score_card_persons table. */
+/**
+ * One subscriber/guarantor person — see score_card_persons table.
+ *
+ * creditScore, worstDpdDays and enquiryCount6Months are bureau-fetched fields
+ * (from the CIBIL/credit-bureau report pull) — they are meant to be populated by
+ * an upstream bureau-integration call, not typed in manually by the Branch
+ * Initiator at the Score Card step. See scoring.engine.js for how each factor
+ * consumes them.
+ */
 const personSchema = Joi.object({
   name: Joi.string().trim().min(2).max(120).required(),
   employmentType: Joi.string().valid(...EMPLOYMENT_TYPES).required(),
@@ -17,25 +25,11 @@ const personSchema = Joi.object({
     then: Joi.optional(),
     otherwise: Joi.forbidden()
   }),
-  yearsInBusiness: Joi.number().min(0).max(80).optional(),
-  yearsOfService: Joi.number().min(0).max(60).optional(),
-  employeeCount: Joi.number().integer().min(0).optional(),
-  staffCount: Joi.number().integer().min(0).optional(),
-  permanentGovt: Joi.boolean().optional(),
-  customerVintageYears: Joi.number().min(0).max(80).optional(),
-  personalVisits: Joi.number().integer().min(0).max(999).default(0),
-  propertyCount: Joi.number().integer().min(0).max(50).default(0),
-  propertyValue: Joi.number().min(0).max(999999999999).default(0),
   creditScore: Joi.number().integer().min(300).max(900).allow(null),
-  foir: Joi.number().min(0).max(3).required(), // ratio 0-1 normally, capped generously to allow >100% edge case
+  worstDpdDays: Joi.number().integer().min(0).max(9999).allow(null),
+  enquiryCount6Months: Joi.number().integer().min(0).max(999).allow(null),
   grossIncome: Joi.number().min(0).optional(),
-  netIncome: Joi.number().min(0).optional(),
-  directExposure: Joi.number().min(0).default(0),
-  indirectExposure: Joi.number().min(0).default(0),
-  suitFiled: Joi.boolean().default(false),
-  prlFlag: Joi.boolean().default(false),
-  cc3Flag: Joi.boolean().default(false),
-  chequeBounceCount: Joi.number().integer().min(0).max(999).default(0)
+  netIncome: Joi.number().min(0).optional()
 });
 
 /**
@@ -71,9 +65,14 @@ const securitySchema = Joi.object({
 const createScoreCardSchema = Joi.object({
   applicationId: Joi.string().pattern(/^MCF-\d{4}-\d{6}$/).required()
     .messages({ 'string.pattern.base': 'applicationId must match MCF-YYYY-NNNNNN' }),
-  chitValue: Joi.number().positive().required(),
+  chitValue: Joi.number().positive().required(), // also the proposed loan amount for Security Coverage
   futureLiability: Joi.number().positive().required(),
   documentsComplete: Joi.boolean().default(false),
+  // Income-EMI Coverage factor inputs — subscriber's income/obligations, carried
+  // over from earlier application-intake steps (not re-typed at the score card step).
+  grossMonthlyIncome: Joi.number().min(0).required(),
+  existingObligations: Joi.number().min(0).default(0),
+  proposedEmi: Joi.number().min(0).required(),
   subscriber: personSchema.required(),
   guarantors: Joi.array().items(personSchema).max(4).default([]),
   securities: Joi.array().items(securitySchema).min(1).required()
@@ -84,6 +83,9 @@ const updateScoreCardSchema = Joi.object({
   chitValue: Joi.number().positive(),
   futureLiability: Joi.number().positive(),
   documentsComplete: Joi.boolean(),
+  grossMonthlyIncome: Joi.number().min(0),
+  existingObligations: Joi.number().min(0),
+  proposedEmi: Joi.number().min(0),
   subscriber: personSchema,
   guarantors: Joi.array().items(personSchema).max(4),
   securities: Joi.array().items(securitySchema).min(1),
@@ -122,7 +124,7 @@ const listQuerySchema = Joi.object({
   page: Joi.number().integer().min(1).default(1),
   pageSize: Joi.number().integer().min(1).max(100).default(20),
   status: Joi.string().valid('DRAFT', 'VALIDATED', 'SUBMITTED', 'UNDER_REVIEW', 'APPROVED', 'REJECTED'),
-  riskGrade: Joi.string().valid('A', 'B', 'C', 'D'),
+  eligible: Joi.boolean(),
   applicationId: Joi.string(),
   createdBy: Joi.number().integer(),
   sort: Joi.string().pattern(/^[a-z_]+:(asc|desc)$/i),

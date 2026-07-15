@@ -11,27 +11,24 @@ function mapScoreCardRow(row) {
     applicationId: row.application_id,
     version: row.version,
     status: row.status,
-    segment: {
-      category: row.segment_category,
-      bucket: row.segment_bucket,
-      method: row.scoring_method
-    },
     chitValue: Number(row.chit_value),
     futureLiability: Number(row.future_liability),
     securityTotalValue: Number(row.security_total_value),
     documentsComplete: row.documents_complete,
     securityCoversLiability: row.security_covers_liability,
     cibilComplete: row.cibil_complete,
+    grossMonthlyIncome: Number(row.gross_monthly_income),
+    existingObligations: Number(row.existing_obligations),
+    proposedEmi: Number(row.proposed_emi),
     scores: {
-      sbPositiveScore: row.sb_positive_score != null ? Number(row.sb_positive_score) : null,
-      sbNegativeScore: row.sb_negative_score != null ? Number(row.sb_negative_score) : null,
-      sbFinalScore: row.sb_final_score != null ? Number(row.sb_final_score) : null,
-      avgGuarantorScore: Number(row.avg_guarantor_score),
-      sbWeightage: Number(row.sb_weightage),
-      guarantorWeightage: Number(row.guarantor_weightage),
-      finalWeightedScore: row.final_weighted_score != null ? Number(row.final_weighted_score) : null,
-      riskGrade: row.risk_grade,
-      riskLabel: row.risk_label,
+      cibilFactorScore: row.cibil_factor_score != null ? Number(row.cibil_factor_score) : null,
+      incomeEmiScore: row.income_emi_score != null ? Number(row.income_emi_score) : null,
+      securityCoverageScore: row.security_coverage_score != null ? Number(row.security_coverage_score) : null,
+      dpdHistoryScore: row.dpd_history_score != null ? Number(row.dpd_history_score) : null,
+      enquiryCountScore: row.enquiry_count_score != null ? Number(row.enquiry_count_score) : null,
+      guarantorQualityScore: row.guarantor_quality_score != null ? Number(row.guarantor_quality_score) : null,
+      totalScore: row.total_score != null ? Number(row.total_score) : null,
+      eligible: row.eligible,
       decisionText: row.decision_text
     },
     audit: {
@@ -63,28 +60,11 @@ function mapPersonRow(row) {
     name: row.name,
     employmentType: row.employment_type,
     entityType: row.entity_type,
-    yearsInBusiness: row.years_in_business != null ? Number(row.years_in_business) : null,
-    yearsOfService: row.years_of_service != null ? Number(row.years_of_service) : null,
-    employeeCount: row.employee_count,
-    staffCount: row.staff_count,
-    permanentGovt: row.permanent_govt,
-    customerVintageYears: row.customer_vintage_years != null ? Number(row.customer_vintage_years) : null,
-    personalVisits: row.personal_visits,
-    propertyCount: row.property_count,
-    propertyValue: Number(row.property_value),
     creditScore: row.credit_score,
-    foir: row.foir != null ? Number(row.foir) : null,
+    worstDpdDays: row.worst_dpd_days,
+    enquiryCount6Months: row.enquiry_count_6m,
     grossIncome: row.gross_income != null ? Number(row.gross_income) : null,
-    netIncome: row.net_income != null ? Number(row.net_income) : null,
-    directExposure: Number(row.direct_exposure),
-    indirectExposure: Number(row.indirect_exposure),
-    suitFiled: row.suit_filed,
-    prlFlag: row.prl_flag,
-    cc3Flag: row.cc3_flag,
-    chequeBounceCount: row.cheque_bounce_count,
-    positiveScore: row.positive_score != null ? Number(row.positive_score) : null,
-    negativeScore: row.negative_score != null ? Number(row.negative_score) : null,
-    finalScore: row.final_score != null ? Number(row.final_score) : null
+    netIncome: row.net_income != null ? Number(row.net_income) : null
   };
 }
 
@@ -132,13 +112,13 @@ const repository = {
     return rows.map(mapSecurityRow);
   },
 
-  async list({ page, pageSize, offset, sortField, sortDir, status, riskGrade, applicationId, createdBy, fromDate, toDate }) {
+  async list({ page, pageSize, offset, sortField, sortDir, status, eligible, applicationId, createdBy, fromDate, toDate }) {
     const where = ['is_deleted = FALSE'];
     const params = [];
     let i = 1;
 
     if (status) { where.push(`status = $${i++}`); params.push(status); }
-    if (riskGrade) { where.push(`risk_grade = $${i++}`); params.push(riskGrade); }
+    if (eligible !== undefined) { where.push(`eligible = $${i++}`); params.push(eligible); }
     if (applicationId) { where.push(`application_id = $${i++}`); params.push(applicationId); }
     if (createdBy) { where.push(`created_by = $${i++}`); params.push(createdBy); }
     if (fromDate) { where.push(`created_at >= $${i++}`); params.push(fromDate); }
@@ -160,34 +140,25 @@ const repository = {
   },
 
   /** Creates the score card + its person/security children inside one transaction. */
-  async create({ applicationId, chitValue, futureLiability, documentsComplete, subscriber, guarantors, securities, createdBy }) {
+  async create({ applicationId, chitValue, futureLiability, documentsComplete, grossMonthlyIncome, existingObligations, proposedEmi, subscriber, guarantors, securities, createdBy }) {
     return withTransaction(async (client) => {
       const cardResult = await client.query(
         `INSERT INTO score_cards
-           (application_id, chit_value, future_liability, documents_complete, created_by)
-         VALUES ($1, $2, $3, $4, $5)
+           (application_id, chit_value, future_liability, documents_complete, gross_monthly_income, existing_obligations, proposed_emi, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          RETURNING *`,
-        [applicationId, chitValue, futureLiability, documentsComplete, createdBy]
+        [applicationId, chitValue, futureLiability, documentsComplete, grossMonthlyIncome, existingObligations || 0, proposedEmi, createdBy]
       );
       const card = cardResult.rows[0];
 
       await client.query(
         `INSERT INTO score_card_persons
-           (score_card_id, person_role, name, employment_type, entity_type, years_in_business, years_of_service,
-            employee_count, staff_count, permanent_govt, customer_vintage_years, personal_visits,
-            property_count, property_value, credit_score, foir, gross_income, net_income,
-            direct_exposure, indirect_exposure, suit_filed, prl_flag, cc3_flag, cheque_bounce_count)
-         VALUES ($1,'SB',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
+           (score_card_id, person_role, name, employment_type, entity_type, credit_score, worst_dpd_days, enquiry_count_6m, gross_income, net_income)
+         VALUES ($1,'SB',$2,$3,$4,$5,$6,$7,$8,$9)`,
         [
           card.id, subscriber.name, subscriber.employmentType, subscriber.entityType || null,
-          subscriber.yearsInBusiness || null, subscriber.yearsOfService || null,
-          subscriber.employeeCount || null, subscriber.staffCount || null, subscriber.permanentGovt ?? null,
-          subscriber.customerVintageYears || null, subscriber.personalVisits || 0,
-          subscriber.propertyCount || 0, subscriber.propertyValue || 0, subscriber.creditScore || null,
-          subscriber.foir, subscriber.grossIncome || null, subscriber.netIncome || null,
-          subscriber.directExposure || 0, subscriber.indirectExposure || 0,
-          subscriber.suitFiled || false, subscriber.prlFlag || false, subscriber.cc3Flag || false,
-          subscriber.chequeBounceCount || 0
+          subscriber.creditScore ?? null, subscriber.worstDpdDays ?? null, subscriber.enquiryCount6Months ?? null,
+          subscriber.grossIncome || null, subscriber.netIncome || null
         ]
       );
 
@@ -195,18 +166,12 @@ const repository = {
         const g = guarantors[idx];
         await client.query(
           `INSERT INTO score_card_persons
-             (score_card_id, person_role, name, employment_type, entity_type, years_in_business, years_of_service,
-              employee_count, staff_count, permanent_govt, customer_vintage_years, personal_visits,
-              property_count, property_value, credit_score, foir, gross_income, net_income,
-              direct_exposure, indirect_exposure, suit_filed, prl_flag, cc3_flag, cheque_bounce_count)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`,
+             (score_card_id, person_role, name, employment_type, entity_type, credit_score, worst_dpd_days, enquiry_count_6m, gross_income, net_income)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
           [
             card.id, `SURETY-${idx + 1}`, g.name, g.employmentType, g.entityType || null,
-            g.yearsInBusiness || null, g.yearsOfService || null, g.employeeCount || null, g.staffCount || null,
-            g.permanentGovt ?? null, g.customerVintageYears || null, g.personalVisits || 0,
-            g.propertyCount || 0, g.propertyValue || 0, g.creditScore || null, g.foir,
-            g.grossIncome || null, g.netIncome || null, g.directExposure || 0, g.indirectExposure || 0,
-            g.suitFiled || false, g.prlFlag || false, g.cc3Flag || false, g.chequeBounceCount || 0
+            g.creditScore ?? null, g.worstDpdDays ?? null, g.enquiryCount6Months ?? null,
+            g.grossIncome || null, g.netIncome || null
           ]
         );
       }
@@ -229,6 +194,9 @@ const repository = {
       chitValue: 'chit_value',
       futureLiability: 'future_liability',
       documentsComplete: 'documents_complete',
+      grossMonthlyIncome: 'gross_monthly_income',
+      existingObligations: 'existing_obligations',
+      proposedEmi: 'proposed_emi',
       remarks: 'remarks'
     };
     const sets = [];
@@ -255,17 +223,12 @@ const repository = {
     for (const p of people) {
       await runner.query(
         `INSERT INTO score_card_persons
-           (score_card_id, person_role, name, employment_type, entity_type, years_in_business, years_of_service,
-            employee_count, staff_count, permanent_govt, customer_vintage_years, personal_visits,
-            property_count, property_value, credit_score, foir, gross_income, net_income,
-            direct_exposure, indirect_exposure, suit_filed, prl_flag, cc3_flag, cheque_bounce_count)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`,
+           (score_card_id, person_role, name, employment_type, entity_type, credit_score, worst_dpd_days, enquiry_count_6m, gross_income, net_income)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
         [
-          id, p.role, p.name, p.employmentType, p.entityType || null, p.yearsInBusiness || null, p.yearsOfService || null,
-          p.employeeCount || null, p.staffCount || null, p.permanentGovt ?? null, p.customerVintageYears || null,
-          p.personalVisits || 0, p.propertyCount || 0, p.propertyValue || 0, p.creditScore || null, p.foir,
-          p.grossIncome || null, p.netIncome || null, p.directExposure || 0, p.indirectExposure || 0,
-          p.suitFiled || false, p.prlFlag || false, p.cc3Flag || false, p.chequeBounceCount || 0
+          id, p.role, p.name, p.employmentType, p.entityType || null,
+          p.creditScore ?? null, p.worstDpdDays ?? null, p.enquiryCount6Months ?? null,
+          p.grossIncome || null, p.netIncome || null
         ]
       );
     }
@@ -283,18 +246,16 @@ const repository = {
     const runner = client || { query };
     await runner.query(
       `UPDATE score_cards SET
-         segment_category = $1, segment_bucket = $2, scoring_method = $3,
-         security_total_value = $4, security_covers_liability = $5, cibil_complete = $6,
-         sb_positive_score = $7, sb_negative_score = $8, sb_final_score = $9,
-         avg_guarantor_score = $10, final_weighted_score = $11,
-         risk_grade = $12, risk_label = $13, decision_text = $14
-       WHERE id = $15`,
+         security_total_value = $1, security_covers_liability = $2, cibil_complete = $3,
+         cibil_factor_score = $4, income_emi_score = $5, security_coverage_score = $6,
+         dpd_history_score = $7, enquiry_count_score = $8, guarantor_quality_score = $9,
+         total_score = $10, eligible = $11, decision_text = $12
+       WHERE id = $13`,
       [
-        computed.segment.category, computed.segment.bucket, computed.segment.method,
         computed.securityTotalValue, computed.securityCoversLiability, computed.cibilComplete,
-        computed.sb.positive, computed.sb.negative, computed.sb.final,
-        computed.avgGuarantorScore, computed.finalWeightedScore,
-        computed.riskGrade, computed.riskLabel, computed.decisionText,
+        computed.factors.cibilScore.score, computed.factors.incomeEmiCoverage.score, computed.factors.securityCoverage.score,
+        computed.factors.dpdHistory.score, computed.factors.enquiryCount.score, computed.factors.guarantorQuality.score,
+        computed.totalScore, computed.eligible, computed.decisionText,
         id
       ]
     );

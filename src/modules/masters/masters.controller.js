@@ -26,10 +26,10 @@ module.exports = {
 
   // GET /masters/score-bands
   scoreBands: asyncHandler(async (req, res) => {
-    const { rows } = await query(`SELECT * FROM cam_score_band_master ORDER BY display_order`);
+    const { rows } = await query(`SELECT * FROM scorecard_decision_band_master ORDER BY display_order`);
     ok(res, rows.map((r) => ({
       minScore: Number(r.min_score), maxScore: Number(r.max_score),
-      grade: r.grade, label: r.label, decisionText: r.decision_text
+      bandCode: r.band_code, label: r.label, decisionText: r.decision_text
     })));
   }),
 

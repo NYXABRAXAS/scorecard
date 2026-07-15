@@ -58,13 +58,16 @@ CREATE TABLE security_type_master (
   updated_at      TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 
-CREATE TABLE cam_score_band_master (
+-- Decision thresholds for the total_score (out of 100) computed by the 6-factor
+-- Score Card engine. NOTE: these thresholds (75 / 60) are an engineering DEFAULT
+-- pending Client confirmation — see DOCUMENTATION.md Section 6 "Assumptions".
+CREATE TABLE scorecard_decision_band_master (
   id              SMALLSERIAL  PRIMARY KEY,
   min_score       NUMERIC(6,2) NOT NULL,
   max_score       NUMERIC(6,2) NOT NULL,
-  grade           CHAR(1)      NOT NULL,               -- A / B / C / D
-  label           VARCHAR(40)  NOT NULL,               -- Low Risk / Moderate Risk / High Risk / Reject
-  decision_text   VARCHAR(60)  NOT NULL,               -- Auto approval / Approve with Conditions / ...
+  band_code       VARCHAR(20)  NOT NULL,               -- ELIGIBLE / CONDITIONAL / NOT_ELIGIBLE
+  label           VARCHAR(60)  NOT NULL,
+  decision_text   VARCHAR(60)  NOT NULL,
   display_order   SMALLINT     NOT NULL,
   CONSTRAINT chk_band_range CHECK (max_score >= min_score)
 );
@@ -82,31 +85,30 @@ CREATE TABLE score_cards (
   CONSTRAINT chk_status CHECK (status IN
     ('DRAFT','VALIDATED','SUBMITTED','UNDER_REVIEW','APPROVED','REJECTED')),
 
-  -- --- Segmentation (Annexure 2, Sections 2-3) ---
-  segment_category        VARCHAR(10),   -- secured / unsecured
-  segment_bucket           VARCHAR(20),   -- <=10L / >10L / <=8L / 8L-25L / >25L
-  scoring_method           VARCHAR(15),   -- simple / moderate / comprehensive
-  CONSTRAINT chk_scoring_method CHECK (scoring_method IN ('simple','moderate','comprehensive') OR scoring_method IS NULL),
-
-  -- --- Inputs driving segmentation & guards ---
-  chit_value               NUMERIC(14,2) NOT NULL,
+  -- --- Inputs driving the 6-factor score & submit guards ---
+  chit_value               NUMERIC(14,2) NOT NULL,       -- also treated as the proposed loan amount for Security Coverage
   future_liability         NUMERIC(14,2) NOT NULL,
   security_total_value     NUMERIC(14,2) NOT NULL DEFAULT 0,
   documents_complete       BOOLEAN       NOT NULL DEFAULT FALSE,
   security_covers_liability BOOLEAN      NOT NULL DEFAULT FALSE,
   cibil_complete            BOOLEAN      NOT NULL DEFAULT FALSE,
+  gross_monthly_income      NUMERIC(14,2) NOT NULL DEFAULT 0,  -- subscriber's gross monthly income (Income-EMI Coverage input)
+  existing_obligations      NUMERIC(14,2) NOT NULL DEFAULT 0,  -- subscriber's existing monthly EMI/obligations
+  proposed_emi              NUMERIC(14,2) NOT NULL DEFAULT 0,  -- this loan's proposed monthly instalment
 
-  -- --- Computed scoring outputs (Annexure 2, Sections 4-6) ---
-  sb_positive_score         NUMERIC(6,2),
-  sb_negative_score         NUMERIC(6,2),
-  sb_final_score            NUMERIC(6,2),
-  avg_guarantor_score       NUMERIC(6,2) NOT NULL DEFAULT 0,
-  sb_weightage              NUMERIC(4,3) NOT NULL DEFAULT 0.6,
-  guarantor_weightage       NUMERIC(4,3) NOT NULL DEFAULT 0.4,
-  final_weighted_score      NUMERIC(6,2),
-  risk_grade                CHAR(1),
-  risk_label                VARCHAR(40),
-  decision_text             VARCHAR(60),
+  -- --- Computed 6-factor scoring outputs (see src/modules/scorecard/scoring.engine.js) ---
+  -- NOTE: these band boundaries are engineering DEFAULTS pending Client confirmation —
+  -- see DOCUMENTATION.md Section 6 "Assumptions" — unlike the security valuation
+  -- formula (Section 5.7), which IS sourced from the signed-off FRD.
+  cibil_factor_score        NUMERIC(5,2),   -- max 20
+  income_emi_score          NUMERIC(5,2),   -- max 20
+  security_coverage_score   NUMERIC(5,2),   -- max 15
+  dpd_history_score         NUMERIC(5,2),   -- max 20
+  enquiry_count_score       NUMERIC(5,2),   -- max 15
+  guarantor_quality_score   NUMERIC(5,2),   -- max 10
+  total_score               NUMERIC(5,2),   -- sum of the 6 factors, max 100
+  eligible                  BOOLEAN,        -- total_score >= 75 (see decisionFor() for the exact threshold)
+  decision_text             VARCHAR(60),    -- "Eligible for Approval" / "Conditional - Manual Review Required" / "Not Eligible"
 
   -- --- Workflow / lifecycle actors ---
   created_by                BIGINT       NOT NULL REFERENCES app_user(id),
@@ -179,6 +181,12 @@ CREATE TABLE score_card_persons (
   property_count         INT          NOT NULL DEFAULT 0,
   property_value         NUMERIC(14,2) NOT NULL DEFAULT 0,
   credit_score            INT,                       -- CIBIL / bureau score
+  -- Bureau-fetched fields (Section 6.2 factors) — these come from the CIBIL/bureau
+  -- report pull, never typed in manually by the Branch Initiator at the score card
+  -- step. worst_dpd_days/enquiry_count_6m are read from the SUBSCRIBER row by the
+  -- scoring engine; a guarantor row may also carry them for completeness/audit.
+  worst_dpd_days          INT,                        -- worst days-past-due across the bureau history; NULL/0 = clean
+  enquiry_count_6m        INT,                         -- hard enquiries in the last 6 months
   foir                    NUMERIC(5,4),               -- ratio 0-1
   gross_income            NUMERIC(14,2),
   net_income              NUMERIC(14,2),
@@ -188,11 +196,6 @@ CREATE TABLE score_card_persons (
   prl_flag                BOOLEAN      NOT NULL DEFAULT FALSE,
   cc3_flag                BOOLEAN      NOT NULL DEFAULT FALSE,
   cheque_bounce_count     INT          NOT NULL DEFAULT 0,
-
-  -- Computed (Annexure 2 output, persisted for audit/history)
-  positive_score          NUMERIC(6,2),
-  negative_score           NUMERIC(6,2),
-  final_score              NUMERIC(6,2),
 
   created_at               TIMESTAMPTZ  NOT NULL DEFAULT now(),
   updated_at               TIMESTAMPTZ  NOT NULL DEFAULT now(),

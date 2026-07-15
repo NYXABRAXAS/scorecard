@@ -8,34 +8,43 @@ before a loan application is submitted for scrutiny, and again — more formally
 the Credit Final Checker builds the Credit Appraisal Memo (CAM). It is a standalone REST
 API + PostgreSQL backend, independently deployable from the rest of MCF LOS.
 
-The business logic implemented here is **not invented for this service** — it is
-sourced from two authoritative documents, each covering a different part of the
-module:
+The business logic implemented here draws on two authoritative documents, each
+covering a different part of the module:
 
-1. **Risk-Assessment Scoring Engine ("Annexure 2")** — the person-level Positive/
-   Negative scoring, segmentation, FOIR bands, and A–D grade bands (Section 5.1–5.4,
-   5.6). Already implemented client-side in the MCF LOS prototype
-   (`assets/js/cam-engine.js`); this service is a faithful, unit-tested port of it.
-2. **MuthootPappachan_LoanProcessing_FRD_v11** (Functional Requirements Document,
+1. **MuthootPappachan_LoanProcessing_FRD_v11** (Functional Requirements Document,
    Version 2.0) — the Score Card completeness/validation gate (Section 10, "Key
    System Validations & Business Rules"; Section 5.5 here), the Case Status
-   Workflow (Section 11), and — corrected in this build — the per-security-type
-   **Accepted Value Formula** (Section 6.1, Table 20; see Section 5.7 here). Note
-   that in this FRD, "Scorecard" refers to a **document/data-completeness gate**,
-   not a numeric points-based scoring system — there is no such point-matrix in
-   the FRD; any UI mockup showing one (e.g. a static "CIBIL Score Factor +15 pts"
-   widget) predates this FRD and was never wired to real computation.
+   Workflow (Section 11), and the per-security-type **Accepted Value Formula**
+   (Section 6.1, Table 20; see Section 5.6 here). In this FRD, "Scorecard" refers
+   to a **document/data-completeness gate**, not a numeric points-based scoring
+   system — there is no point-matrix in the FRD itself.
+2. **The 6-factor scoring model** (CIBIL Score, Income-EMI Coverage, Security
+   Coverage/LTV, DPD History, Enquiry Count, Guarantor Quality — Section 5.1–5.4
+   here) — this is the numeric points system, confirmed against a UI reference
+   example (CIBIL 748 → ~15/20 checks out exactly on a linear scale). **The exact
+   band boundaries for the other five factors are engineering DEFAULTS, not yet
+   confirmed by Credit Policy** — see [Section 22 — Assumptions](#22-assumptions--open-questions)
+   for the full list of what still needs sign-off before this goes live. An
+   earlier, differently-structured scoring model ("Annexure 2" — Positive/Negative
+   scoring with Profile Strength/FOIR/Asset-Net-Worth sub-scores) was evaluated and
+   superseded by this 6-factor model at the Client's direction; it is no longer
+   used by this service.
 
-Every formula, band, and guard condition in this codebase traces back to one of
-these two sources. Where a business rule was not explicit in either, it is called
-out under [Section 22 — Assumptions](#22-assumptions--open-questions), not silently
-guessed.
+The security valuation formula (Section 5.6) is grounded in the signed-off FRD and
+should be treated as authoritative. The 6-factor scoring bands (Section 5.1–5.4)
+are a proposed starting point, explicitly pending confirmation — treat every band
+boundary there as a hypothesis to be corrected during local testing, not a
+finished specification.
 
 **What this service does:**
-- Accepts subscriber, guarantor, and security data for a loan application.
-- Computes a Positive/Negative/Final risk score per person, a chit-value-and-security
-  driven segment (Secured/Unsecured × value bucket), and a final weighted score.
-- Maps the final score to a risk grade (A–D) and a default decision.
+- Accepts subscriber, guarantor, security, and income/EMI data for a loan
+  application — all meant to be system-sourced (bureau report pull, or carried
+  over from earlier application-intake steps), not manually re-typed at the
+  Score Card step itself.
+- Computes 6 factor scores (CIBIL Score, Income-EMI Coverage, Security Coverage,
+  DPD History, Enquiry Count, Guarantor Quality) summing to a total out of 100.
+- Maps the total score to a decision (Eligible for Approval / Conditional -
+  Manual Review Required / Not Eligible).
 - Enforces the three guard conditions that gate submission (documents complete,
   security covers future liability, CIBIL complete for every person).
 - Runs the full Draft → Validate → Submit → Approve/Reject lifecycle with a complete,
@@ -43,8 +52,9 @@ guessed.
 
 **What this service deliberately does not do:** originate the loan application itself,
 manage chit/auction data, handle disbursement, or replace the full 10-section CAM
-(sections A–J) — those remain the responsibility of the main MCF LOS application; this
-service is the Score Card sub-module within it, callable standalone via its own API.
+(sections A–J) used elsewhere in MCF LOS — those remain the responsibility of the
+main MCF LOS application; this service is the Score Card sub-module within it,
+callable standalone via its own API.
 
 ---
 
@@ -69,25 +79,27 @@ flowchart LR
 | Field | M/O | Notes |
 |---|---|---|
 | `applicationId` | Mandatory | Must match `MCF-YYYY-NNNNNN`; one score card per application |
-| `chitValue` | Mandatory | Drives segment bucket and the asset-net-worth test |
+| `chitValue` | Mandatory | Also treated as the proposed loan amount for the Security Coverage factor |
 | `futureLiability` | Mandatory | Drives the `securityCoversLiability` guard |
 | `documentsComplete` | Mandatory (boolean, defaults false) | Drives one of the three submit guards |
+| `grossMonthlyIncome` | Mandatory | Income-EMI Coverage factor input |
+| `existingObligations` | Optional (defaults 0) | Income-EMI Coverage factor input |
+| `proposedEmi` | Mandatory | Income-EMI Coverage factor input; also the denominator for Guarantor Quality's income component |
 | `subscriber` | Mandatory | Full `Person` object — see Section 5 |
-| `guarantors` | Optional (0–4) | Absent guarantors mean the final score is the SB score alone |
-| `securities` | Mandatory (min. 1) | Drives `securityTotalValue` and secured/unsecured segmentation |
-| `subscriber.foir` | Mandatory | Required for every scoring method (simple/moderate/comprehensive) |
-| `subscriber.creditScore` | Optional at create, **mandatory before Validate can pass** | See `cibilComplete` guard |
+| `guarantors` | Optional (0–4) | Absent guarantors mean Guarantor Quality defaults to a neutral 10/10 |
+| `securities` | Mandatory (min. 1) | Drives `securityTotalValue`, which feeds both the Security Coverage factor and the `securityCoversLiability` guard |
+| `subscriber.creditScore` | Optional at create, **mandatory before Validate can pass** | Bureau-fetched; see `cibilComplete` guard and the CIBIL Score factor |
+| `subscriber.worstDpdDays`, `subscriber.enquiryCount6Months` | Optional (null treated as clean/zero) | Bureau-fetched; feed the DPD History and Enquiry Count factors |
 | `entityType` | Conditional | Required only when `employmentType = "Business"`, forbidden otherwise |
-| Comprehensive-KYC-only fields (`employeeCount`, `propertyCount`, `propertyValue`, `customerVintageYears`, `personalVisits`) | Optional | Only affect scoring under the `comprehensive` method; ignored under `simple`/`moderate` |
 
 ### 2.3 Section dependencies
 
-- **Segmentation depends on Securities** — you cannot know the scoring method until
-  the security list (and hence secured/unsecured classification) is known, so
-  `securities` is required at creation, not deferred to a later step.
-- **Scoring depends on Segmentation** — the same `Person` data scores differently
-  under `simple` vs. `moderate` vs. `comprehensive`, because segmentation determines
-  which formula runs (see Section 6).
+- **Security Coverage depends on Securities** — the accepted security value must be
+  computed (Section 5.6) before the Security Coverage factor (Section 5.2) can run,
+  so `securities` is required at creation, not deferred to a later step.
+- **Guarantor Quality depends on `proposedEmi`** — the income-adequacy component is
+  a ratio against `proposedEmi`, so that field must be present even if there is no
+  guarantor (in which case the factor is skipped entirely and defaults to 10).
 - **Submit depends on Validate** — `POST /submit` will reject with
   `INVALID_STATE_FOR_SUBMIT` unless the card is already `VALIDATED`; validation is not
   an implicit side-effect of submit, by design, so a UI can show the client exactly
@@ -115,14 +127,14 @@ scorecardapi/
 │   │   │   └── scoring.engine.js  # <- the pure calculation engine (zero DB/HTTP deps)
 │   │   └── masters/              # dropdown reference data
 │   └── utils/                    # ApiError, apiResponse envelope, pagination
-├── tests/                          # 155 automated tests (see Section 14)
+├── tests/                          # 119 automated tests (see Section 14)
 ├── openapi.yaml                     # full OpenAPI 3.0 spec, served at GET /docs
 └── DOCUMENTATION.md                  # this file
 ```
 
 **Layering (routes → controller → service → repository → DB):** the `scoring.engine.js`
-module is intentionally the only place the actual Annexure 2 math lives, with zero
-dependency on Express or `pg` — it is unit-testable in complete isolation (see the 81
+module is intentionally the only place the 6-factor scoring math lives, with zero
+dependency on Express or `pg` — it is unit-testable in complete isolation (see the 45
 tests in `tests/scoring.engine.test.js`), and could be lifted into a batch/offline
 recompute job unchanged.
 
@@ -148,10 +160,10 @@ erDiagram
     varchar application_id UK
     int version
     varchar status
-    varchar segment_category
-    varchar scoring_method
-    numeric final_weighted_score
-    char risk_grade
+    numeric gross_monthly_income
+    numeric proposed_emi
+    numeric total_score
+    boolean eligible
     boolean is_deleted
   }
   score_card_persons {
@@ -159,8 +171,8 @@ erDiagram
     uuid score_card_id FK
     varchar person_role
     int credit_score
-    numeric foir
-    numeric final_score
+    int worst_dpd_days
+    int enquiry_count_6m
   }
   score_card_securities {
     bigserial id PK
@@ -200,75 +212,95 @@ Full DDL: [`db/schema.sql`](db/schema.sql). Highlights:
 
 ## 5. Business Rules
 
-### 5.1 Segmentation (Annexure 2, Sections 2–3)
+### 5.1 The 6 scoring factors (sum to 100)
 
-| Security backing | Chit value | Segment | Scoring method |
-|---|---|---|---|
-| Any of Gold/LIC/BG/FD/Chit Passbook/Sub-Debt/Demat NCD/Demat Shares | ≤ ₹10L | Secured ≤10L | **Simple** |
-| (same list) | > ₹10L | Secured >10L | **Moderate** |
-| Only Mortgage and/or Personal Surety (no tangible collateral) | ≤ ₹8L | Unsecured ≤8L | **Comprehensive** |
-| (same) | ₹8L–₹25L | Unsecured 8L-25L | **Comprehensive** |
-| (same) | > ₹25L | Unsecured >25L | **Comprehensive** |
+> **These band boundaries are engineering defaults, not yet confirmed by Credit
+> Policy** — see [Section 22](#22-assumptions--open-questions) for the
+> full confirmation checklist. The only value independently verified against a
+> reference example is the CIBIL Score factor (748 → 14.93/20, exact match on a
+> linear 300–900 scale).
 
-> Mortgage and Personal Surety are excluded from the "Secured" list deliberately —
-> Annexure 2 treats them as carrying no bankable collateral value for scoring purposes,
-> even though a security row exists for them.
+| # | Factor | Max | Input(s) | Source |
+|---|---|---|---|---|
+| 1 | CIBIL Score | 20 | `subscriber.creditScore` | Bureau report pull |
+| 2 | Income-EMI Coverage | 20 | `grossMonthlyIncome`, `existingObligations`, `proposedEmi` | Application intake |
+| 3 | Security Coverage / LTV | 15 | accepted security value vs. `chitValue` (proposed loan amount) | Computed (Section 5.6) |
+| 4 | DPD History | 20 | `subscriber.worstDpdDays` | Bureau report pull |
+| 5 | Enquiry Count | 15 | `subscriber.enquiryCount6Months` | Bureau report pull |
+| 6 | Guarantor Quality | 10 | first guarantor's `creditScore` + income vs. `proposedEmi` | Bureau + application intake |
 
-### 5.2 Scoring formula by method
+All bureau-sourced inputs (CIBIL score, DPD history, enquiry count) are meant to
+be populated by an upstream bureau-integration call — **not typed in manually by
+the Branch Initiator at the Score Card step**. This is the core principle
+confirmed with the Client: the Score Card auto-computes from data already
+captured earlier in the application flow plus the CIBIL fetch, not from
+free-text entry at the scorecard screen itself.
 
-- **Simple** (Secured ≤10L): flat **100** — security value already had to equal or
-  exceed the Future Liability before the case could reach this stage, so no further
-  positive scoring is needed.
-- **Moderate** (Secured >10L): **70** (flat) + **FOIR band, max 30**.
-- **Comprehensive** (all Unsecured buckets): **Profile Strength (max 20)** +
-  **Vintage/Visit (max 5)** + **Income Stability (max 5)** + **FOIR (max 40)** +
-  **Asset & Net Worth (max 30)** = **100 max**.
+### 5.2 Factor formulas
 
-FOIR bands (percentage of income committed to obligations):
+1. **CIBIL Score (max 20)** — linear scale: `clamp((creditScore − 300) / 600 × 20, 0, 20)`.
+2. **Income-EMI Coverage (max 20)** — FOIR band on `(existingObligations + proposedEmi) / grossMonthlyIncome`:
 
-| FOIR | Moderate (max 30) | Comprehensive (max 40) |
+   | FOIR | Score |
+   |---|---|
+   | < 30% | 20 |
+   | 30–44% | 15 |
+   | 45–59% | 10 |
+   | 60–74% | 7.5 |
+   | 75–94% | 5 |
+   | ≥ 95% | 0 |
+
+3. **Security Coverage / LTV (max 15)** — band on `acceptedSecurityValue / chitValue`:
+
+   | Coverage ratio | Score |
+   |---|---|
+   | ≥ 125% | 15 |
+   | 100–124% | 12 |
+   | 80–99% | 9 |
+   | 60–79% | 6 |
+   | 40–59% | 3 |
+   | < 40% | 0 |
+
+4. **DPD History (max 20)** — band on worst days-past-due in the bureau report:
+
+   | Worst DPD | Score |
+   |---|---|
+   | None / 0 (clean) | 20 |
+   | 1–29 days | 14 |
+   | 30–59 days | 8 |
+   | 60–89 days | 4 |
+   | 90+ days | 0 |
+
+5. **Enquiry Count (max 15)** — band on hard enquiries in the last 6 months:
+
+   | Enquiries | Score |
+   |---|---|
+   | 0 | 15 |
+   | 1–2 | 12 |
+   | 3–4 | 8 |
+   | 5–6 | 4 |
+   | 7+ | 0 |
+
+6. **Guarantor Quality (max 10)** — `cibilComponent (max 6) + incomeComponent (max 4)`.
+   No guarantor present → neutral full marks (10), since a guarantor is
+   conditional, not mandatory (FRD Section 6.2).
+   - `cibilComponent = clamp((guarantor.creditScore − 300) / 600 × 6, 0, 6)`
+   - `incomeComponent`: guarantor income ÷ `proposedEmi` ratio ≥1.5→4, ≥1.0→3, ≥0.5→2, else 0.
+   - **Only the first guarantor feeds this factor** — an explicit simplification;
+     see [Section 22](#22-assumptions--open-questions) if multi-guarantor
+     averaging is wanted instead.
+
+### 5.3 Decision thresholds
+
+`totalScore = ` sum of all 6 factors (max 100).
+
+| Total Score | Decision | `eligible` |
 |---|---|---|
-| < 30% | 30 | 40 |
-| 30–44% | 20 | 30 |
-| 45–59% | 15 | 20 |
-| 60–74% | 10 | 15 |
-| 75–94% | 5 | 10 |
-| ≥ 95% | 0 | 0 |
+| ≥ 75 | Eligible for Approval | `true` |
+| 60–74.99 | Conditional - Manual Review Required | `false` |
+| < 60 | Not Eligible | `false` |
 
-Comprehensive-method sub-scores:
-- **Profile Strength (max 20)**: Govt/PSU = 20 flat. Salaried-Private scales by
-  employer size (>100 staff + ≥3yrs tenure = 16; ≥20 staff = 12; else 8; unknown
-  employer size defaults to 12). Business/Self-Employed scales by entity type
-  (PvtLtd ≥5yrs = 20, else 17; Partnership >20 staff = 18, else 14; Proprietorship
-  >10 staff = 15, else 10; unknown entity detail defaults to 8). Everyone else
-  (agriculture/unorganised/other) = 4.
-- **Vintage/Visit (max 5)**: the *better* of a vintage-years score (>3yrs=5, ≥1yr=3,
-  else 1) or a personal-visit-count score (≥3 visits=5, ≥1=3, else 0) — not additive.
-- **Income Stability (max 5)**: >7yrs service/business = 5, ≥2yrs = 3, else 2 — except
-  Govt/PSU with `permanentGovt !== false`, which is a flat 5 regardless of tenure.
-- **Asset & Net Worth (max 30)**: requires property value ≥ 2× the chit value to
-  qualify at all; 2+ qualifying properties = 30, 1 = 20, otherwise 0.
-
-### 5.3 Negative scoring (all methods, capped at −150 total)
-
-| Flag | Penalty | Exemption |
-|---|---|---|
-| Suit filed | −100 | None — applies to every segment |
-| PRL (Prior Repayment Lapse) | −30 | **Exempt for Secured ≤10L only** |
-| CC3 flag | −10 | Exempt for **any** Secured segment |
-| Cheque bounce count > 2 | −10 | Exempt for **any** Secured segment |
-
-Final person score = `clamp(positive − negative, 0, 100)`.
-
-### 5.4 Weighting & grade
-
-- **No guarantors**: final weighted score = SB's final score, unchanged.
-- **1+ guarantors**: final weighted score = `SB × 60% + average(guarantor finals) × 40%`.
-- **Grade bands**: A = 70–100 (Low Risk, Auto approval) · B = 51–69 (Moderate Risk,
-  Approve with Conditions) · C = 40–50 (High Risk, Strong Justification Required) ·
-  D = ≤39 (Reject, Not Recommended).
-
-### 5.5 Submit guards (mandatory conditions)
+### 5.4 Submit guards (mandatory conditions)
 
 A score card can only move `DRAFT → VALIDATED` (and therefore only be submitted) when
 **all three** of the following hold — these mirror the exact guard array MCF LOS's
@@ -279,13 +311,13 @@ A score card can only move `DRAFT → VALIDATED` (and therefore only be submitte
 3. Every person (subscriber + all guarantors) has a non-null `creditScore`
    (`cibilComplete`)
 
-### 5.6 Role-wise restrictions
+### 5.5 Role-wise restrictions
 
 See [Section 8 — RBAC Matrix](#8-security). In summary: **BI** creates/edits/submits
 its own drafts; **FC, RA, CH, FA, BA** (holders of `caseApprove`/`caseReject`) approve
 or reject a submitted card; only **ADMIN** currently holds `auditView`.
 
-### 5.7 Security Accepted Value Formula (FRD Section 6.1, Table 20)
+### 5.6 Security Accepted Value Formula (FRD Section 6.1, Table 20)
 
 `valueLoaded` — the amount of a security's value actually counted toward covering
 the Future Liability — is **always computed server-side** (`src/modules/scorecard/securityValuation.js`)
@@ -324,18 +356,20 @@ is a flat, per-type formula table — **not** a uniform LTV-cap percentage.
 ## 6. Calculation Engine Reference
 
 Implemented in [`src/modules/scorecard/scoring.engine.js`](src/modules/scorecard/scoring.engine.js),
-covered by 81 unit tests. Calculation sequence for one score card:
+covered by 45 unit tests. Calculation sequence for one score card:
 
-1. `determineSegment(securities, chitValue)` → `{ category, bucket, method }`
-2. For the subscriber, then each guarantor: `personScore(person, segment, chitValue)`
-   → `{ positive, negative, final }`
-3. `avgGuarantorScore` = mean of guarantor finals (0 if none)
-4. `finalWeightedScore` = `guarantors.length ? sb.final*0.6 + avg*0.4 : sb.final`
-   (rounded to 2 decimals)
-5. `gradeFor(finalWeightedScore)` → `{ grade, label, decision }`
-6. `securityTotalValue` = sum of `valueLoaded` across all securities
-7. Guard booleans (`documentsComplete`, `securityCoversLiability`, `cibilComplete`) are
-   derived and `readyToSubmit` = AND of all three.
+1. `securityTotalValue` = sum of `valueLoaded` across all securities (each already
+   server-computed per the Section 5.6 formula).
+2. `cibilFactorScore(subscriber.creditScore)` → factor 1 (max 20).
+3. `incomeEmiCoverageScore(grossMonthlyIncome, existingObligations, proposedEmi)` → factor 2 (max 20).
+4. `securityCoverageScore(securityTotalValue, chitValue)` → factor 3 (max 15).
+5. `dpdHistoryScore(subscriber.worstDpdDays)` → factor 4 (max 20).
+6. `enquiryCountScore(subscriber.enquiryCount6Months)` → factor 5 (max 15).
+7. `guarantorQualityScore(guarantors[0] || null, proposedEmi)` → factor 6 (max 10).
+8. `totalScore` = sum of factors 1–6 (rounded to 2 decimals).
+9. `decisionFor(totalScore)` → `{ eligible, decisionText }` (Section 5.3 thresholds).
+10. Guard booleans (`documentsComplete`, `securityCoversLiability`, `cibilComplete`) are
+    derived and `readyToSubmit` = AND of all three.
 
 ---
 
@@ -470,7 +504,7 @@ Every error response uses the same envelope (`src/middleware/errorHandler.js`):
 - **Pagination**: every list endpoint (`GET /score-cards`, `/history`, `/audit-logs`)
   is paginated (`page`, `pageSize`, max 100) with a `meta` block (`totalRecords`,
   `totalPages`).
-- **Filtering & sorting**: `GET /score-cards` supports `status`, `riskGrade`,
+- **Filtering & sorting**: `GET /score-cards` supports `status`, `eligible`,
   `applicationId`, `createdBy`, `fromDate`/`toDate`, and a whitelisted `sort` field
   (rejecting arbitrary column names prevents SQL-injection-via-ORDER-BY).
 - **Indexes**: partial unique index on `score_cards(application_id) WHERE NOT
@@ -536,12 +570,12 @@ version history tells you *exactly what it looked like* at that point in time.
 
 ## 14. Test Cases
 
-155 automated tests, all passing against a real PostgreSQL instance (not mocked):
+119 automated tests, all passing against a real PostgreSQL instance (not mocked):
 
 | File | Count | Covers |
 |---|---|---|
-| `tests/scoring.engine.test.js` | 81 | Every formula/band/segment boundary in Section 6, incl. the exact Annexure 2 worked-example numbers |
-| `tests/securityValuation.test.js` | 19 | Every security type's Accepted Value Formula (Section 5.7 / FRD Table 20), incl. the Demat Shares ₹2L boundary and missing-required-field errors |
+| `tests/scoring.engine.test.js` | 45 | Every one of the 6 factors' bands/boundaries (Section 5.2), incl. the exact CIBIL-748 reference example |
+| `tests/securityValuation.test.js` | 19 | Every security type's Accepted Value Formula (Section 5.6 / FRD Table 20), incl. the Demat Shares ₹2L boundary and missing-required-field errors |
 | `tests/scorecard.validation.test.js` | 20 | Joi schema positive/negative/boundary cases, incl. SQL-injection-shaped and oversized inputs |
 | `tests/scorecard.api.test.js` | 35 | Full HTTP lifecycle: auth, RBAC (positive + negative per role), guard failures, status-transition rule violations, pagination/filtering/sorting, soft delete, audit/history endpoints |
 
@@ -641,8 +675,16 @@ is called out explicitly as an assumption.
 | # | Item | Type | Detail |
 |---|---|---|---|
 | 1 | `UNDER_REVIEW` status | Assumption | Modelled in the schema and guards for forward-compatibility; no v1 endpoint transitions a card into it. If a "Start Review" action is wanted (e.g. to lock a card from further BI edits the moment FC opens it), it is a small, additive change. |
-| 2 | Multiple guarantors' relative weighting | Assumption | The Annexure's worked example covers exactly one guarantor; this implementation averages all guarantors equally before applying the 40% weight, which is the natural generalisation but was not explicitly spelled out for >1 guarantor. |
+| 2 | Only the first guarantor feeds Guarantor Quality | Assumption — **needs Credit Policy confirmation** | If multiple guarantors are onboarded, only `guarantors[0]` affects the score. Confirm whether all guarantors should be averaged, the best/worst should be used, or the current single-guarantor behaviour is correct. |
 | 3 | `auditView` is ADMIN-only | Confirmed-as-is | Mirrors the live `roles-permissions.json` exactly. If Compliance/FC should also see audit logs in production, that is a one-line change to the permission matrix, not an architectural one — flagged for the Client to confirm. |
 | 4 | Score card ↔ main LOS case linkage | Assumption | This service tracks `applicationId` as a plain string key; it does not call back into the main LOS's `WorkflowEngine` itself. The orchestrating layer (or an event/webhook, not yet built) is expected to advance the main case's status once `/submit` or `/approve` succeeds here — see Section 11. |
 | 5 | Schema migrations beyond v1 | Assumption | `db/schema.sql` is a single baseline; adopt a migration tool before the first post-launch schema change. |
 | 6 | Document upload is reference-only | Confirmed-as-is | This API never receives raw file bytes — see Section 12. |
+| 7 | CIBIL Score factor formula (Section 5.2.1) | **Confirmed** | Linear scale across 300–900 checks out exactly against the one available reference example (748 → 14.93 ≈ 15/20). |
+| 8 | Income-EMI Coverage bands (Section 5.2.2) | **Needs Credit Policy confirmation** | FOIR band thresholds (30/45/60/75/95%) and point values are an engineering default, reusing the shape of a FOIR table seen in an earlier scoring model — not verified against this 6-factor model's actual reference numbers. |
+| 9 | Security Coverage / LTV bands (Section 5.2.3) | **Needs Credit Policy confirmation** | Coverage-ratio thresholds (40/60/80/100/125%) and point values are an engineering default. |
+| 10 | DPD History bands (Section 5.2.4) | **Needs Credit Policy confirmation** | Days-past-due thresholds (29/59/89) and point values are an engineering default; confirm against the Client's actual delinquency-bucket policy. |
+| 11 | Enquiry Count bands (Section 5.2.5) | **Needs Credit Policy confirmation** | Enquiry-count thresholds (2/4/6) and point values are an engineering default. |
+| 12 | Guarantor Quality formula (Section 5.2.6) | **Needs Credit Policy confirmation** | The 6-point CIBIL / 4-point income split, and the income-ratio bands (0.5/1.0/1.5×), are an engineering default; the "no guarantor → neutral 10" rule should also be confirmed as intended (vs. e.g. a lower default when a guarantor was expected but not provided). |
+| 13 | Decision thresholds — 75 / 60 (Section 5.3) | **Needs Credit Policy confirmation** | Matches the one reference example available ("Score above threshold (75). Eligible for approval."), but the 60-74 "Conditional" band's existence and exact boundary were not independently confirmed. |
+| 14 | `proposedEmi` source | Assumption | Expected to be computed elsewhere (loan amount, tenure, interest rate) and passed in — this service does not compute an EMI from principal/tenure/rate itself. |

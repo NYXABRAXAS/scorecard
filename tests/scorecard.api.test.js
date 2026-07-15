@@ -14,7 +14,7 @@ let biToken;
 let fcToken;
 let devToken;
 
-const validSubscriber = { name: 'Ramesh Gopalakrishnan', employmentType: 'Salaried-Private', foir: 0.3, employeeCount: 50, creditScore: 748 };
+const validSubscriber = { name: 'Ramesh Gopalakrishnan', employmentType: 'Salaried-Private', creditScore: 748 };
 const validSecurity = { securityType: 'Gold Ornaments', netWeightGrams: 150, ratePerGram: 6000 }; // -> valueLoaded 900000
 
 function scoreCardPayload(overrides = {}) {
@@ -23,6 +23,9 @@ function scoreCardPayload(overrides = {}) {
     chitValue: 900000,
     futureLiability: 800000,
     documentsComplete: true,
+    grossMonthlyIncome: 50000,
+    existingObligations: 5000,
+    proposedEmi: 8000,
     subscriber: validSubscriber,
     guarantors: [],
     securities: [validSecurity],
@@ -208,7 +211,8 @@ describe('Validate -> Submit lifecycle guards (documentsComplete, securityCovers
     const approveRes = await request(app).post(`/api/v1/score-cards/${id}/approve`).set('Authorization', `Bearer ${fcToken}`).send({ remarks: 'Looks good' });
     expect(approveRes.status).toBe(200);
     expect(approveRes.body.data.status).toBe('APPROVED');
-    expect(approveRes.body.data.scores.riskGrade).toBe('A');
+    expect(approveRes.body.data.scores.eligible).toBe(true);
+    expect(approveRes.body.data.scores.decisionText).toBe('Eligible for Approval');
   });
 
   test('reject requires a rejectionReason of at least 5 characters', async () => {
@@ -301,7 +305,8 @@ describe('GET /api/v1/score-cards/:id/summary, /history, /audit-logs', () => {
     const res = await request(app).get(`/api/v1/score-cards/${id}/summary`).set('Authorization', `Bearer ${biToken}`);
     expect(res.status).toBe(200);
     expect(res.body.data.readyToSubmit).toBe(true);
-    expect(res.body.data.riskGrade).toBe('A');
+    expect(res.body.data.eligible).toBe(true);
+    expect(res.body.data.decisionText).toBe('Eligible for Approval');
   });
 
   test('history contains a snapshot per lifecycle transition, newest first', async () => {
@@ -348,10 +353,10 @@ describe('GET /api/v1/masters/* (Get Dropdown Masters)', () => {
     expect(res.body.data.find((s) => s.securityType === 'Gold Ornaments').ltvCap).toBeCloseTo(0.75);
   });
 
-  test('score-bands returns the 4 A-D grade bands', async () => {
+  test('score-bands returns the 3 decision bands (Eligible / Conditional / Not Eligible)', async () => {
     const res = await request(app).get('/api/v1/masters/score-bands').set('Authorization', `Bearer ${biToken}`);
     expect(res.status).toBe(200);
-    expect(res.body.data.map((b) => b.grade)).toEqual(['A', 'B', 'C', 'D']);
+    expect(res.body.data.map((b) => b.bandCode)).toEqual(['ELIGIBLE', 'CONDITIONAL', 'NOT_ELIGIBLE']);
   });
 
   test('masters require authentication', async () => {
