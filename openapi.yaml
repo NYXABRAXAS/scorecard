@@ -107,8 +107,7 @@ paths:
                 - securityType: Chit Passbook
                   holderName: Kalaivani Natarajan
                   loyaltyUsn: USN7106
-                  freeValue: 3300000
-                  valueLoaded: 3300000
+                  apiSourcedValue: 3300000
       responses:
         '201':
           description: Score card created in DRAFT status
@@ -540,13 +539,29 @@ components:
 
     Security:
       type: object
-      required: [securityType, freeValue, valueLoaded]
+      required: [securityType]
+      description: >
+        `valueLoaded` (the Accepted Value) is ALWAYS server-computed from the
+        type-specific raw input fields below, per the FRD Section 6.1 Accepted Value
+        Formula table — it is never accepted as raw client input. Which raw fields
+        are required depends on `securityType`; see DOCUMENTATION.md Section 5.7.
       properties:
-        securityType: { type: string }
+        securityType:
+          type: string
+          enum: [Gold Ornaments, LIC Policy, Bank Guarantee, Fixed Deposit, Sub-Debt, "Mortgage (Property)", Chit Passbook, Demat NCD, Demat Shares, Personal Surety]
         holderName: { type: string, nullable: true }
         loyaltyUsn: { type: string, nullable: true }
-        freeValue: { type: number }
-        valueLoaded: { type: number }
+        netWeightGrams: { type: number, description: "Gold Ornaments only" }
+        ratePerGram: { type: number, description: "Gold Ornaments only" }
+        surrenderValue: { type: number, description: "LIC Policy only" }
+        faceValue: { type: number, description: "Bank Guarantee / Fixed Deposit / Demat NCD" }
+        apiSourcedValue: { type: number, description: 'Sub-Debt / Chit Passbook ("As per API")' }
+        maturityDate: { type: string, format: date, description: "Sub-Debt only" }
+        forcedSaleValue: { type: number, description: "Mortgage (Property) only" }
+        marketValue: { type: number, description: "Demat Shares only" }
+        liabilityToSecure: { type: number, description: "Demat Shares only" }
+        freeValue: { type: number, readOnly: true, description: "Server-computed gross/reference value before the formula reduction" }
+        valueLoaded: { type: number, readOnly: true, description: "Server-computed Accepted Value, after the type-specific formula" }
 
     CreateScoreCardRequest:
       type: object

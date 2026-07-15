@@ -41,11 +41,17 @@ CREATE TABLE app_user (
   updated_at      TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 
+-- NOTE: ltv_cap here is informational/admin-display only (kept for the dropdown-master
+-- endpoint and historical continuity with the rest of MCF LOS). It is NOT used to
+-- compute a security's accepted value — that is done by the formula-based calculator
+-- in src/modules/scorecard/securityValuation.js, per the FRD's Section 6.1 Accepted
+-- Value Formula table (which is per-type: 100% face/surrender value for most types,
+-- with special formulas only for Mortgage and Demat Shares — not a flat LTV cap).
 CREATE TABLE security_type_master (
   security_type   VARCHAR(40)  PRIMARY KEY,           -- e.g. 'Gold Ornaments'
   category        VARCHAR(20)  NOT NULL,              -- Primary / Collateral / Subordinate / Guarantee
   is_secured      BOOLEAN      NOT NULL,              -- drives Secured vs Unsecured segment determination
-  ltv_cap         NUMERIC(5,4),                        -- ratio 0-1; NULL for Personal Surety
+  ltv_cap         NUMERIC(5,4),                        -- informational only — see note above
   approval_authority VARCHAR(60) NOT NULL,
   status          VARCHAR(10)  NOT NULL DEFAULT 'Active',
   created_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
@@ -205,8 +211,14 @@ CREATE TABLE score_card_securities (
   security_type     VARCHAR(40) NOT NULL REFERENCES security_type_master(security_type),
   holder_name       VARCHAR(120),
   loyalty_usn       VARCHAR(40),
-  free_value        NUMERIC(14,2) NOT NULL,
-  value_loaded      NUMERIC(14,2) NOT NULL,          -- accepted value after type-specific formula
+  -- Type-specific raw inputs to the Accepted Value Formula (FRD Section 6.1, Table 20)
+  -- e.g. {"netWeightGrams":145,"ratePerGram":6200} for Gold, {"surrenderValue":250000}
+  -- for LIC Policy, etc. — see src/modules/scorecard/securityValuation.js. Kept as JSONB
+  -- since required fields differ by type; free_value/value_loaded below are always the
+  -- server-computed summary, never trusted from client input.
+  valuation_inputs  JSONB       NOT NULL DEFAULT '{}',
+  free_value        NUMERIC(14,2) NOT NULL,           -- gross/reference value before any formula reduction
+  value_loaded      NUMERIC(14,2) NOT NULL,           -- accepted value AFTER the type-specific formula — server-computed
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

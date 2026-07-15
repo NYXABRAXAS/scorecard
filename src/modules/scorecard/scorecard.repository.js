@@ -94,6 +94,7 @@ function mapSecurityRow(row) {
     securityType: row.security_type,
     holderName: row.holder_name,
     loyaltyUsn: row.loyalty_usn,
+    valuationInputs: row.valuation_inputs,
     freeValue: Number(row.free_value),
     valueLoaded: Number(row.value_loaded)
   };
@@ -212,9 +213,9 @@ const repository = {
 
       for (const s of securities) {
         await client.query(
-          `INSERT INTO score_card_securities (score_card_id, security_type, holder_name, loyalty_usn, free_value, value_loaded)
-           VALUES ($1,$2,$3,$4,$5,$6)`,
-          [card.id, s.securityType, s.holderName || null, s.loyaltyUsn || null, s.freeValue, s.valueLoaded]
+          `INSERT INTO score_card_securities (score_card_id, security_type, holder_name, loyalty_usn, valuation_inputs, free_value, value_loaded)
+           VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+          [card.id, s.securityType, s.holderName || null, s.loyaltyUsn || null, JSON.stringify(s.valuationInputs || {}), s.freeValue, s.valueLoaded]
         );
       }
 
@@ -270,9 +271,9 @@ const repository = {
     }
     for (const s of securities || []) {
       await runner.query(
-        `INSERT INTO score_card_securities (score_card_id, security_type, holder_name, loyalty_usn, free_value, value_loaded)
-         VALUES ($1,$2,$3,$4,$5,$6)`,
-        [id, s.securityType, s.holderName || null, s.loyaltyUsn || null, s.freeValue, s.valueLoaded]
+        `INSERT INTO score_card_securities (score_card_id, security_type, holder_name, loyalty_usn, valuation_inputs, free_value, value_loaded)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [id, s.securityType, s.holderName || null, s.loyaltyUsn || null, JSON.stringify(s.valuationInputs || {}), s.freeValue, s.valueLoaded]
       );
     }
   },

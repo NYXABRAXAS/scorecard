@@ -5,7 +5,7 @@ const {
 } = require('../src/modules/scorecard/scorecard.validation');
 
 const validSubscriber = { name: 'Ramesh Gopalakrishnan', employmentType: 'Salaried-Private', foir: 0.3, employeeCount: 50 };
-const validSecurity = { securityType: 'Gold Ornaments', freeValue: 900000, valueLoaded: 675000 };
+const validSecurity = { securityType: 'Gold Ornaments', netWeightGrams: 150, ratePerGram: 6000 };
 
 function baseValidPayload(overrides = {}) {
   return {

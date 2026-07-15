@@ -2,8 +2,18 @@
 
 const repository = require('./scorecard.repository');
 const { computeScoreCard } = require('./scoring.engine');
+const { prepareSecurity } = require('./securityValuation');
 const ApiError = require('../../utils/ApiError');
 const { withTransaction } = require('../../config/db');
+
+/**
+ * Computes freeValue/valueLoaded server-side for every security per the FRD's
+ * Accepted Value Formula (securityValuation.js) — a client-supplied valueLoaded is
+ * never trusted or persisted directly.
+ */
+function prepareSecurities(securities) {
+  return (securities || []).map(prepareSecurity);
+}
 
 /** Legal status transitions — the single source of truth for the lifecycle guard. */
 const TRANSITIONS = {
@@ -72,7 +82,7 @@ const service = {
       });
     }
 
-    const id = await repository.create({ ...input, createdBy: actor.id });
+    const id = await repository.create({ ...input, securities: prepareSecurities(input.securities), createdBy: actor.id });
 
     // Compute the initial segment/score/guard preview immediately, so the create
     // response already reflects real numbers instead of all-null/default-zero
@@ -120,10 +130,12 @@ const service = {
     await withTransaction(async (client) => {
       await repository.update(id, patch, client);
       if (patch.subscriber || patch.guarantors || patch.securities) {
+        // oldValue.securities are already in prepared/computed shape (from getById);
+        // only patch.securities is raw client input that still needs valuation.
         const merged = {
           subscriber: patch.subscriber || oldValue.subscriber,
           guarantors: patch.guarantors || oldValue.guarantors,
-          securities: patch.securities || oldValue.securities
+          securities: patch.securities ? prepareSecurities(patch.securities) : oldValue.securities
         };
         await repository.replacePersonsAndSecurities(id, merged, client);
       }
@@ -163,7 +175,7 @@ const service = {
       await repository.replacePersonsAndSecurities(id, {
         subscriber: patch.subscriber || current.subscriber,
         guarantors: patch.guarantors || current.guarantors,
-        securities: patch.securities || current.securities
+        securities: patch.securities ? prepareSecurities(patch.securities) : current.securities
       }, null);
     }
     await repository.insertAuditLog({

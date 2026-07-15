@@ -41,8 +41,8 @@ curl -X POST http://localhost:4000/api/v1/auth/login \
 npm test
 ```
 
-136 tests (81 calculation-engine unit tests + 20 validation-schema tests + 35 API
-integration tests), all runnable against a real PostgreSQL instance — see
+155 tests (81 calculation-engine + 19 security-valuation + 20 validation-schema +
+35 API integration tests), all runnable against a real PostgreSQL instance — see
 [DOCUMENTATION.md §14](DOCUMENTATION.md#14-test-cases).
 
 ## Stack

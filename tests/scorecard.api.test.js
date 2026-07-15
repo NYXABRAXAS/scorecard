@@ -15,7 +15,7 @@ let fcToken;
 let devToken;
 
 const validSubscriber = { name: 'Ramesh Gopalakrishnan', employmentType: 'Salaried-Private', foir: 0.3, employeeCount: 50, creditScore: 748 };
-const validSecurity = { securityType: 'Gold Ornaments', freeValue: 900000, valueLoaded: 900000 };
+const validSecurity = { securityType: 'Gold Ornaments', netWeightGrams: 150, ratePerGram: 6000 }; // -> valueLoaded 900000
 
 function scoreCardPayload(overrides = {}) {
   return {

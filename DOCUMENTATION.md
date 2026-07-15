@@ -8,13 +8,28 @@ before a loan application is submitted for scrutiny, and again — more formally
 the Credit Final Checker builds the Credit Appraisal Memo (CAM). It is a standalone REST
 API + PostgreSQL backend, independently deployable from the rest of MCF LOS.
 
-The scoring logic implemented here is **not new business logic invented for this
-service** — it is a faithful, unit-tested port of the exact calculation already
-running client-side in the MCF LOS prototype (`assets/js/cam-engine.js`), which itself
-implements *"Annexure 2: Risk-Assessment Scoring Engine"* precisely. Every formula,
-band, and guard condition in this codebase traces back to that source. Where a
-business rule was not explicit in the source material, it is called out under
-[Section 22 — Assumptions](#22-assumptions--open-questions), not silently guessed.
+The business logic implemented here is **not invented for this service** — it is
+sourced from two authoritative documents, each covering a different part of the
+module:
+
+1. **Risk-Assessment Scoring Engine ("Annexure 2")** — the person-level Positive/
+   Negative scoring, segmentation, FOIR bands, and A–D grade bands (Section 5.1–5.4,
+   5.6). Already implemented client-side in the MCF LOS prototype
+   (`assets/js/cam-engine.js`); this service is a faithful, unit-tested port of it.
+2. **MuthootPappachan_LoanProcessing_FRD_v11** (Functional Requirements Document,
+   Version 2.0) — the Score Card completeness/validation gate (Section 10, "Key
+   System Validations & Business Rules"; Section 5.5 here), the Case Status
+   Workflow (Section 11), and — corrected in this build — the per-security-type
+   **Accepted Value Formula** (Section 6.1, Table 20; see Section 5.7 here). Note
+   that in this FRD, "Scorecard" refers to a **document/data-completeness gate**,
+   not a numeric points-based scoring system — there is no such point-matrix in
+   the FRD; any UI mockup showing one (e.g. a static "CIBIL Score Factor +15 pts"
+   widget) predates this FRD and was never wired to real computation.
+
+Every formula, band, and guard condition in this codebase traces back to one of
+these two sources. Where a business rule was not explicit in either, it is called
+out under [Section 22 — Assumptions](#22-assumptions--open-questions), not silently
+guessed.
 
 **What this service does:**
 - Accepts subscriber, guarantor, and security data for a loan application.
@@ -100,7 +115,7 @@ scorecardapi/
 │   │   │   └── scoring.engine.js  # <- the pure calculation engine (zero DB/HTTP deps)
 │   │   └── masters/              # dropdown reference data
 │   └── utils/                    # ApiError, apiResponse envelope, pagination
-├── tests/                          # 136 automated tests (see Section 21)
+├── tests/                          # 155 automated tests (see Section 14)
 ├── openapi.yaml                     # full OpenAPI 3.0 spec, served at GET /docs
 └── DOCUMENTATION.md                  # this file
 ```
@@ -269,6 +284,40 @@ A score card can only move `DRAFT → VALIDATED` (and therefore only be submitte
 See [Section 8 — RBAC Matrix](#8-security). In summary: **BI** creates/edits/submits
 its own drafts; **FC, RA, CH, FA, BA** (holders of `caseApprove`/`caseReject`) approve
 or reject a submitted card; only **ADMIN** currently holds `auditView`.
+
+### 5.7 Security Accepted Value Formula (FRD Section 6.1, Table 20)
+
+`valueLoaded` — the amount of a security's value actually counted toward covering
+the Future Liability — is **always computed server-side** (`src/modules/scorecard/securityValuation.js`)
+from type-specific raw inputs. It is **never** accepted as a raw number from the
+client; doing so would let a caller bypass the accepted-value rule entirely. This
+is a flat, per-type formula table — **not** a uniform LTV-cap percentage.
+
+| Security Type | Required Input(s) | Accepted Value Formula |
+|---|---|---|
+| Gold Ornaments | `netWeightGrams`, `ratePerGram` | `netWeightGrams × ratePerGram` (no haircut) |
+| LIC Policy | `surrenderValue` | 100% of Surrender Value |
+| Bank Guarantee | `faceValue` | 100% of Face Value |
+| Fixed Deposit | `faceValue` | 100% of Face Value |
+| Demat NCD | `faceValue` | 100% of Face Value |
+| Sub-Debt (Deposit with Group Co.) | `apiSourcedValue`, `maturityDate` | "As per API" — accepted as given, not computed |
+| Chit Passbook (Pledge) | `apiSourcedValue` | "As per API" — accepted as given, not computed |
+| Mortgage (Property) | `forcedSaleValue` | `(forcedSaleValue ÷ 150) × 100` |
+| Demat Shares | `marketValue`, `liabilityToSecure` | `liabilityToSecure < ₹2L` → `50% × marketValue`; else `min(50% × marketValue, 40% × liabilityToSecure)` |
+| Personal Surety | — | 0 (no tangible security value; guarantor net worth is assessed separately per FRD Section 6.2) |
+
+> **Note on naming**: the FRD's Table 20 uses slightly different literal wording
+> for some rows (e.g. "Gold" not "Gold Ornaments", "Chit Passbook Pledge" not "Chit
+> Passbook", "Deposit with Group Co. (Sub-Debt)" not "Sub-Debt"). This service uses
+> the canonical security-type names already in use across the rest of MCF LOS
+> (`assets/json/security-types.json`) so this API keys against the same identifiers
+> every other MCF LOS screen already uses — only the **formula** is taken from the
+> FRD, not the exact row labels.
+>
+> `security_type_master.ltv_cap` (seeded from the earlier, simpler LTV-cap model)
+> is retained for informational/dropdown display only — it is **not** used by
+> `computeAcceptedValue()` and should not be treated as authoritative for accepted-value
+> calculations.
 
 ---
 
@@ -487,11 +536,12 @@ version history tells you *exactly what it looked like* at that point in time.
 
 ## 14. Test Cases
 
-136 automated tests, all passing against a real PostgreSQL instance (not mocked):
+155 automated tests, all passing against a real PostgreSQL instance (not mocked):
 
 | File | Count | Covers |
 |---|---|---|
 | `tests/scoring.engine.test.js` | 81 | Every formula/band/segment boundary in Section 6, incl. the exact Annexure 2 worked-example numbers |
+| `tests/securityValuation.test.js` | 19 | Every security type's Accepted Value Formula (Section 5.7 / FRD Table 20), incl. the Demat Shares ₹2L boundary and missing-required-field errors |
 | `tests/scorecard.validation.test.js` | 20 | Joi schema positive/negative/boundary cases, incl. SQL-injection-shaped and oversized inputs |
 | `tests/scorecard.api.test.js` | 35 | Full HTTP lifecycle: auth, RBAC (positive + negative per role), guard failures, status-transition rule violations, pagination/filtering/sorting, soft delete, audit/history endpoints |
 

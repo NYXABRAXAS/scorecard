@@ -38,12 +38,34 @@ const personSchema = Joi.object({
   chequeBounceCount: Joi.number().integer().min(0).max(999).default(0)
 });
 
+/**
+ * One security/collateral row. `valueLoaded` (the Accepted Value) is ALWAYS
+ * server-computed from the type-specific raw inputs below — per the FRD Section
+ * 6.1 Accepted Value Formula table — never trusted as raw client input (a client
+ * could otherwise submit any valueLoaded and bypass the accepted-value rule
+ * entirely). Which of the optional fields below are actually required depends on
+ * securityType; that per-type check happens in securityValuation.js, not here,
+ * since a 9-way Joi.when() chain is far less readable than one lookup table.
+ */
 const securitySchema = Joi.object({
-  securityType: Joi.string().required(),
+  securityType: Joi.string().valid(...require('./securityValuation').SECURITY_TYPES).required(),
   holderName: Joi.string().max(120).allow('', null),
   loyaltyUsn: Joi.string().max(40).allow('', null),
-  freeValue: Joi.number().min(0).required(),
-  valueLoaded: Joi.number().min(0).required()
+  // Gold Ornaments
+  netWeightGrams: Joi.number().min(0),
+  ratePerGram: Joi.number().min(0),
+  // LIC Policy
+  surrenderValue: Joi.number().min(0),
+  // Bank Guarantee / Fixed Deposit / Demat NCD
+  faceValue: Joi.number().min(0),
+  // Sub-Debt / Chit Passbook ("As per API")
+  apiSourcedValue: Joi.number().min(0),
+  maturityDate: Joi.date().iso(),
+  // Mortgage (Property)
+  forcedSaleValue: Joi.number().min(0),
+  // Demat Shares
+  marketValue: Joi.number().min(0),
+  liabilityToSecure: Joi.number().min(0)
 });
 
 const createScoreCardSchema = Joi.object({
