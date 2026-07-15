@@ -1,0 +1,683 @@
+openapi: 3.0.3
+info:
+  title: MCF LOS — Score Card API
+  version: "1.0.0"
+  description: >
+    REST API for the Score Card module of the MCF Prize-Money-Against-Security Loan
+    Origination System. Implements the Risk-Assessment Scoring Engine (Annexure 2)
+    exactly — see DOCUMENTATION.md for the full business-rule reference.
+  contact:
+    name: MCF LOS Engineering
+servers:
+  - url: /api/v1
+    description: Relative to whichever host this is deployed on (see DOCUMENTATION.md Section 16 for environment URLs)
+
+tags:
+  - name: Auth
+  - name: ScoreCard
+  - name: Masters
+
+security:
+  - bearerAuth: []
+
+paths:
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Authenticate and obtain a JWT access + refresh token pair
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [employeeId, password]
+              properties:
+                employeeId: { type: string, example: EMP-1001 }
+                password: { type: string, format: password, example: Password@123 }
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          accessToken: { type: string }
+                          refreshToken: { type: string }
+                          expiresIn: { type: string, example: 15m }
+                          user: { $ref: '#/components/schemas/UserSummary' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Exchange a valid refresh token for a new access token
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+      responses:
+        '200':
+          description: New access token issued
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /score-cards:
+    post:
+      tags: [ScoreCard]
+      summary: Create Score Card
+      description: Requires the `caseCreate` permission (BI role in the current role matrix).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateScoreCardRequest' }
+            example:
+              applicationId: MCF-2024-001820
+              chitValue: 6750000
+              futureLiability: 6000000
+              documentsComplete: true
+              subscriber:
+                name: Meena Devi Nair
+                employmentType: Salaried-Govt
+                foir: 0.29
+                creditScore: 763
+                customerVintageYears: 4
+              guarantors:
+                - name: Sundar Meenakshisundaram
+                  employmentType: Business
+                  entityType: Proprietorship
+                  staffCount: 4
+                  foir: 0.22
+                  creditScore: 809
+              securities:
+                - securityType: Chit Passbook
+                  holderName: Kalaivani Natarajan
+                  loyaltyUsn: USN7106
+                  freeValue: 3300000
+                  valueLoaded: 3300000
+      responses:
+        '201':
+          description: Score card created in DRAFT status
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/ScoreCard' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+    get:
+      tags: [ScoreCard]
+      summary: List score cards (paginated, filterable, sortable)
+      parameters:
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/PageSize' }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/Status' }
+        - name: riskGrade
+          in: query
+          schema: { type: string, enum: [A, B, C, D] }
+        - name: applicationId
+          in: query
+          schema: { type: string }
+        - name: sort
+          in: query
+          schema: { type: string, example: "created_at:desc" }
+      responses:
+        '200':
+          description: Paginated list
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/ScoreCard' } }
+                      meta: { $ref: '#/components/schemas/PaginationMeta' }
+        '400': { description: Invalid sort field }
+
+  /score-cards/application/{applicationId}:
+    get:
+      tags: [ScoreCard]
+      summary: Get Score Card by Application ID
+      parameters:
+        - name: applicationId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^MCF-\d{4}-\d{6}$' }
+      responses:
+        '200':
+          description: Score card found
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/ScoreCard' } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /score-cards/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/ScoreCardId' }
+    get:
+      tags: [ScoreCard]
+      summary: Get Score Card
+      responses:
+        '200':
+          description: Score card found
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/ScoreCard' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [ScoreCard]
+      summary: Update Score Card
+      description: >
+        Allowed only while status is DRAFT, VALIDATED or REJECTED. Editing a VALIDATED
+        card reverts it to DRAFT (it must be re-validated before it can be re-submitted).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateScoreCardRequest' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/ScoreCard' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/BusinessRuleError' }
+    delete:
+      tags: [ScoreCard]
+      summary: Delete Score Card (soft delete)
+      description: Only permitted while status is DRAFT.
+      responses:
+        '204': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/BusinessRuleError' }
+
+  /score-cards/{id}/draft:
+    parameters: [{ $ref: '#/components/parameters/ScoreCardId' }]
+    patch:
+      tags: [ScoreCard]
+      summary: Save Draft
+      description: Persists in-progress edits with no validation gate and no status change.
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateScoreCardRequest' }
+      responses:
+        '200': { description: Draft saved }
+        '422': { $ref: '#/components/responses/BusinessRuleError' }
+
+  /score-cards/{id}/validate:
+    parameters: [{ $ref: '#/components/parameters/ScoreCardId' }]
+    post:
+      tags: [ScoreCard]
+      summary: Validate Score Card
+      description: >
+        Recomputes the score and evaluates the three submit guards: documentsComplete,
+        securityCoversLiability, cibilComplete. On success (all guards pass), transitions
+        DRAFT -> VALIDATED. On failure, the score card stays DRAFT and the response lists
+        which guards failed (HTTP 422, not an error — check `data.valid`).
+      responses:
+        '200':
+          description: All guards passed; card is now VALIDATED
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/ValidateResult' } }
+        '422':
+          description: One or more guards failed — card remains DRAFT
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/ValidateResult' } }
+
+  /score-cards/{id}/submit:
+    parameters: [{ $ref: '#/components/parameters/ScoreCardId' }]
+    post:
+      tags: [ScoreCard]
+      summary: Submit Score Card
+      description: Requires status VALIDATED (call /validate first).
+      responses:
+        '200': { description: Submitted; status is now SUBMITTED }
+        '422': { $ref: '#/components/responses/BusinessRuleError' }
+
+  /score-cards/{id}/approve:
+    parameters: [{ $ref: '#/components/parameters/ScoreCardId' }]
+    post:
+      tags: [ScoreCard]
+      summary: Approve Score Card
+      description: Requires the `caseApprove` permission and status SUBMITTED.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { remarks: { type: string, maxLength: 2000 } }
+      responses:
+        '200': { description: Approved; status is now APPROVED }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/BusinessRuleError' }
+
+  /score-cards/{id}/reject:
+    parameters: [{ $ref: '#/components/parameters/ScoreCardId' }]
+    post:
+      tags: [ScoreCard]
+      summary: Reject Score Card
+      description: Requires the `caseReject` permission and status SUBMITTED.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rejectionReason]
+              properties: { rejectionReason: { type: string, minLength: 5, maxLength: 2000 } }
+      responses:
+        '200': { description: Rejected; status is now REJECTED }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /score-cards/{id}/recalculate:
+    parameters: [{ $ref: '#/components/parameters/ScoreCardId' }]
+    post:
+      tags: [ScoreCard]
+      summary: Recalculate Score
+      description: Recomputes scores from current inputs without changing status. Blocked once APPROVED or REJECTED.
+      responses:
+        '200': { description: Scores recomputed }
+        '422': { $ref: '#/components/responses/BusinessRuleError' }
+
+  /score-cards/{id}/summary:
+    parameters: [{ $ref: '#/components/parameters/ScoreCardId' }]
+    get:
+      tags: [ScoreCard]
+      summary: Get Score Summary
+      responses:
+        '200':
+          description: Summary of score, grade, decision and guard status
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/ScoreSummary' } }
+
+  /score-cards/{id}/history:
+    parameters: [{ $ref: '#/components/parameters/ScoreCardId' }]
+    get:
+      tags: [ScoreCard]
+      summary: Get Score History
+      description: Every version snapshot (one per create/update/validate/submit/approve/reject/recalculate), newest first.
+      parameters:
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/PageSize' }
+      responses:
+        '200': { description: Paginated version history }
+
+  /score-cards/{id}/audit-logs:
+    parameters: [{ $ref: '#/components/parameters/ScoreCardId' }]
+    get:
+      tags: [ScoreCard]
+      summary: Get Audit Logs
+      description: Requires the `auditView` permission (ADMIN only in the current role matrix).
+      parameters:
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/PageSize' }
+      responses:
+        '200': { description: Paginated audit log }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /score-cards/{id}/documents:
+    parameters: [{ $ref: '#/components/parameters/ScoreCardId' }]
+    post:
+      tags: [ScoreCard]
+      summary: Upload Supporting Documents
+      description: >
+        Requires the `docUpload` permission. Accepts a pre-uploaded file's URL (e.g. a
+        pre-signed S3/Azure Blob URL) rather than a raw multipart body — the API itself
+        does not proxy file bytes; see DOCUMENTATION.md Section 12 for the upload flow.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [documentType, fileName, fileUrl]
+              properties:
+                documentType: { type: string, enum: [DPN, KYC, "Gold Appraisal", "Income Proof", "Address Proof", "Bank Statement", Other] }
+                fileName: { type: string, maxLength: 255 }
+                fileUrl: { type: string, format: uri }
+                mimeType: { type: string }
+                fileSizeBytes: { type: integer, maximum: 26214400 }
+      responses:
+        '201': { description: Document record created }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    get:
+      tags: [ScoreCard]
+      summary: List supporting documents
+      responses:
+        '200': { description: Document list }
+
+  /masters/security-types:
+    get:
+      tags: [Masters]
+      summary: Get Dropdown Masters — Security Types
+      responses:
+        '200': { description: List of security types with LTV caps and approval authority }
+
+  /masters/score-bands:
+    get:
+      tags: [Masters]
+      summary: Get Dropdown Masters — CAM Risk Score Bands
+      responses:
+        '200': { description: A-D grade bands }
+
+  /masters/employment-types:
+    get:
+      tags: [Masters]
+      summary: Get Dropdown Masters — Employment Types
+      responses:
+        '200': { description: Employment type enum }
+
+  /masters/entity-types:
+    get:
+      tags: [Masters]
+      summary: Get Dropdown Masters — Business Entity Types
+      responses:
+        '200': { description: Entity type enum }
+
+  /masters/document-types:
+    get:
+      tags: [Masters]
+      summary: Get Dropdown Masters — Supporting Document Types
+      responses:
+        '200': { description: Document type enum }
+
+  /masters/roles:
+    get:
+      tags: [Masters]
+      summary: Get Dropdown Masters — Roles
+      responses:
+        '200': { description: Role list }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    ScoreCardId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    PageSize:
+      name: pageSize
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+
+  responses:
+    Unauthorized:
+      description: Missing, malformed or expired token
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Forbidden:
+      description: Authenticated but not permitted to perform this action
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    NotFound:
+      description: Resource does not exist
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Conflict:
+      description: Duplicate or conflicting state
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    ValidationError:
+      description: One or more fields failed schema validation
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    BusinessRuleError:
+      description: The request is well-formed but violates a business/workflow rule (e.g. wrong status for this action)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  schemas:
+    Status:
+      type: string
+      enum: [DRAFT, VALIDATED, SUBMITTED, UNDER_REVIEW, APPROVED, REJECTED]
+
+    UserSummary:
+      type: object
+      properties:
+        id: { type: integer }
+        employeeId: { type: string }
+        fullName: { type: string }
+        role: { type: string }
+        branchCode: { type: string, nullable: true }
+
+    Person:
+      type: object
+      required: [name, employmentType, foir]
+      properties:
+        name: { type: string }
+        employmentType: { type: string, enum: [Salaried-Govt, Salaried-PSU, Salaried-Private, Business, "Self Employed - Professional", Agriculture, Other] }
+        entityType: { type: string, enum: [PvtLtd, Partnership, Proprietorship], nullable: true }
+        yearsInBusiness: { type: number }
+        yearsOfService: { type: number }
+        employeeCount: { type: integer }
+        staffCount: { type: integer }
+        permanentGovt: { type: boolean }
+        customerVintageYears: { type: number }
+        personalVisits: { type: integer, default: 0 }
+        propertyCount: { type: integer, default: 0 }
+        propertyValue: { type: number, default: 0 }
+        creditScore: { type: integer, minimum: 300, maximum: 900, nullable: true }
+        foir: { type: number, minimum: 0, maximum: 3 }
+        grossIncome: { type: number }
+        netIncome: { type: number }
+        directExposure: { type: number, default: 0 }
+        indirectExposure: { type: number, default: 0 }
+        suitFiled: { type: boolean, default: false }
+        prlFlag: { type: boolean, default: false }
+        cc3Flag: { type: boolean, default: false }
+        chequeBounceCount: { type: integer, default: 0 }
+
+    Security:
+      type: object
+      required: [securityType, freeValue, valueLoaded]
+      properties:
+        securityType: { type: string }
+        holderName: { type: string, nullable: true }
+        loyaltyUsn: { type: string, nullable: true }
+        freeValue: { type: number }
+        valueLoaded: { type: number }
+
+    CreateScoreCardRequest:
+      type: object
+      required: [applicationId, chitValue, futureLiability, subscriber, securities]
+      properties:
+        applicationId: { type: string, pattern: '^MCF-\d{4}-\d{6}$' }
+        chitValue: { type: number, minimum: 0.01 }
+        futureLiability: { type: number, minimum: 0.01 }
+        documentsComplete: { type: boolean, default: false }
+        subscriber: { $ref: '#/components/schemas/Person' }
+        guarantors: { type: array, items: { $ref: '#/components/schemas/Person' }, maxItems: 4 }
+        securities: { type: array, items: { $ref: '#/components/schemas/Security' }, minItems: 1 }
+
+    UpdateScoreCardRequest:
+      type: object
+      properties:
+        chitValue: { type: number }
+        futureLiability: { type: number }
+        documentsComplete: { type: boolean }
+        subscriber: { $ref: '#/components/schemas/Person' }
+        guarantors: { type: array, items: { $ref: '#/components/schemas/Person' } }
+        securities: { type: array, items: { $ref: '#/components/schemas/Security' } }
+        remarks: { type: string, maxLength: 2000 }
+
+    PersonScore:
+      type: object
+      properties:
+        positive: { type: number }
+        negative: { type: number }
+        final: { type: number }
+
+    Segment:
+      type: object
+      properties:
+        category: { type: string, enum: [secured, unsecured] }
+        bucket: { type: string }
+        method: { type: string, enum: [simple, moderate, comprehensive] }
+
+    ScoreCardScores:
+      type: object
+      properties:
+        sbPositiveScore: { type: number, nullable: true }
+        sbNegativeScore: { type: number, nullable: true }
+        sbFinalScore: { type: number, nullable: true }
+        avgGuarantorScore: { type: number }
+        sbWeightage: { type: number, example: 0.6 }
+        guarantorWeightage: { type: number, example: 0.4 }
+        finalWeightedScore: { type: number, nullable: true }
+        riskGrade: { type: string, enum: [A, B, C, D], nullable: true }
+        riskLabel: { type: string, nullable: true }
+        decisionText: { type: string, nullable: true }
+
+    ScoreCard:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        applicationId: { type: string }
+        version: { type: integer }
+        status: { $ref: '#/components/schemas/Status' }
+        segment: { $ref: '#/components/schemas/Segment' }
+        chitValue: { type: number }
+        futureLiability: { type: number }
+        securityTotalValue: { type: number }
+        documentsComplete: { type: boolean }
+        securityCoversLiability: { type: boolean }
+        cibilComplete: { type: boolean }
+        scores: { $ref: '#/components/schemas/ScoreCardScores' }
+        subscriber: { $ref: '#/components/schemas/Person' }
+        guarantors: { type: array, items: { $ref: '#/components/schemas/Person' } }
+        securities: { type: array, items: { $ref: '#/components/schemas/Security' } }
+        rejectionReason: { type: string, nullable: true }
+        remarks: { type: string, nullable: true }
+
+    ValidateResult:
+      type: object
+      properties:
+        valid: { type: boolean }
+        failedGuards:
+          type: array
+          items:
+            type: object
+            properties:
+              guard: { type: string, enum: [documentsComplete, securityCoversLiability, cibilComplete] }
+              message: { type: string }
+        scoreCard: { $ref: '#/components/schemas/ScoreCard' }
+
+    ScoreSummary:
+      type: object
+      properties:
+        applicationId: { type: string }
+        status: { $ref: '#/components/schemas/Status' }
+        segment: { $ref: '#/components/schemas/Segment' }
+        finalWeightedScore: { type: number, nullable: true }
+        riskGrade: { type: string, nullable: true }
+        riskLabel: { type: string, nullable: true }
+        decisionText: { type: string, nullable: true }
+        readyToSubmit: { type: boolean }
+        guardStatus:
+          type: object
+          properties:
+            documentsComplete: { type: boolean }
+            securityCoversLiability: { type: boolean }
+            cibilComplete: { type: boolean }
+
+    PaginationMeta:
+      type: object
+      properties:
+        page: { type: integer }
+        pageSize: { type: integer }
+        totalRecords: { type: integer }
+        totalPages: { type: integer }
+
+    SuccessEnvelope:
+      type: object
+      properties:
+        success: { type: boolean, example: true }
+        data: {}
+        meta: { $ref: '#/components/schemas/PaginationMeta' }
+
+    ErrorEnvelope:
+      type: object
+      properties:
+        success: { type: boolean, example: false }
+        error:
+          type: object
+          properties:
+            code: { type: string, example: VALIDATION_ERROR }
+            message: { type: string }
+            details:
+              type: array
+              items:
+                type: object
+                properties: { field: { type: string }, message: { type: string } }
+            requestId: { type: string, format: uuid }
