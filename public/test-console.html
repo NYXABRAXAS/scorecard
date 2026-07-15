@@ -1,0 +1,435 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MCF LOS — Score Card API Test Console</title>
+<style>
+  :root {
+    --bg: #f4f6fb; --panel: #ffffff; --border: #dbe1ea; --text: #1c2333; --muted: #64748b;
+    --accent: #2451e0; --accent-dark: #1a3bb0; --ok: #0f9d58; --err: #d92d20; --code-bg: #0d1117; --code-text: #d7e3fc;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0e1420; --panel:#161d2b; --border:#2a3346; --text:#e6ebf5; --muted:#8b96ab; --accent:#5b8dff; --accent-dark:#3f6fe0; --ok:#3ddc84; --err:#ff6b6b; --code-bg:#05070c; --code-text:#cdd9f5; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; font-size:14px; }
+  header { padding:16px 24px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:16px; flex-wrap:wrap; background:var(--panel); position:sticky; top:0; z-index:10; }
+  header h1 { font-size:16px; margin:0; white-space:nowrap; }
+  header input[type=text] { flex:1; min-width:220px; padding:8px 10px; border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--text); font-size:13px; }
+  .badge { font-size:11px; padding:3px 8px; border-radius:999px; font-weight:600; }
+  .badge.up { background:rgba(15,157,88,.15); color:var(--ok); }
+  .badge.down { background:rgba(217,45,32,.15); color:var(--err); }
+  main { max-width:1200px; margin:0 auto; padding:20px; display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  @media (max-width: 900px) { main { grid-template-columns:1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:16px; }
+  .panel.wide { grid-column:1 / -1; }
+  .panel h2 { font-size:13px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin:0 0 12px; }
+  label { display:block; font-size:11px; color:var(--muted); margin-bottom:3px; margin-top:8px; }
+  input, select, textarea { width:100%; padding:7px 9px; border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--text); font-size:13px; font-family:inherit; }
+  input[type=checkbox] { width:auto; }
+  .row { display:flex; gap:10px; }
+  .row > * { flex:1; }
+  .btn { display:inline-block; margin-top:10px; padding:8px 14px; border:none; border-radius:6px; background:var(--accent); color:#fff; font-weight:600; font-size:13px; cursor:pointer; }
+  .btn:hover { background:var(--accent-dark); }
+  .btn.secondary { background:transparent; border:1px solid var(--border); color:var(--text); }
+  .btn.danger { background:var(--err); }
+  .btn.small { padding:5px 10px; font-size:12px; margin:4px 4px 0 0; }
+  .btn-row { display:flex; flex-wrap:wrap; gap:0; margin-top:10px; }
+  .quickusers { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px; }
+  .quickusers button { flex:none; }
+  #currentUser { font-size:12px; color:var(--muted); margin-top:8px; }
+  #currentUser b { color:var(--text); }
+  pre#responseBox { background:var(--code-bg); color:var(--code-text); padding:14px; border-radius:8px; max-height:480px; overflow:auto; font-size:12.5px; line-height:1.5; margin:0; white-space:pre-wrap; word-break:break-word; }
+  .resp-meta { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }
+  .resp-status { font-weight:700; font-size:13px; }
+  .resp-status.s2 { color:var(--ok); }
+  .resp-status.s4, .resp-status.s5 { color:var(--err); }
+  fieldset { border:1px dashed var(--border); border-radius:8px; padding:10px 12px; margin-top:12px; }
+  fieldset legend { font-size:11px; color:var(--muted); padding:0 6px; }
+  .hint { font-size:11px; color:var(--muted); margin-top:4px; }
+  .idfield { display:flex; gap:8px; align-items:flex-end; }
+  .idfield input { flex:1; }
+  .masters-out { font-size:12px; margin-top:8px; }
+  .masters-out table { width:100%; border-collapse:collapse; }
+  .masters-out td, .masters-out th { border-bottom:1px solid var(--border); padding:4px 6px; text-align:left; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🧪 Score Card API Console</h1>
+  <input type="text" id="apiBase" value="https://mcf-scorecard-api.onrender.com">
+  <button class="btn secondary" id="pingBtn" style="margin:0;">Check /health</button>
+  <span class="badge" id="healthBadge">unknown</span>
+</header>
+
+<main>
+
+  <!-- LOGIN -->
+  <div class="panel">
+    <h2>1. Auth</h2>
+    <label>Employee ID</label>
+    <input type="text" id="employeeId" value="EMP-1001">
+    <label>Password</label>
+    <input type="text" id="password" value="Password@123">
+    <div class="quickusers">
+      <button class="btn small secondary" data-emp="EMP-1001">BI (EMP-1001)</button>
+      <button class="btn small secondary" data-emp="EMP-1042">FC (EMP-1042)</button>
+      <button class="btn small secondary" data-emp="EMP-1005">DEV (EMP-1005)</button>
+      <button class="btn small secondary" data-emp="EMP-1010">CH (EMP-1010)</button>
+      <button class="btn small secondary" data-emp="EMP-9001">ADMIN (EMP-9001)</button>
+    </div>
+    <button class="btn" id="loginBtn">Login</button>
+    <div id="currentUser">Not logged in.</div>
+  </div>
+
+  <!-- MASTERS -->
+  <div class="panel">
+    <h2>Dropdown Masters</h2>
+    <div class="btn-row">
+      <button class="btn small secondary" data-master="security-types">Security Types</button>
+      <button class="btn small secondary" data-master="score-bands">Score Bands</button>
+      <button class="btn small secondary" data-master="employment-types">Employment Types</button>
+      <button class="btn small secondary" data-master="entity-types">Entity Types</button>
+      <button class="btn small secondary" data-master="document-types">Document Types</button>
+      <button class="btn small secondary" data-master="roles">Roles</button>
+    </div>
+    <div class="masters-out" id="mastersOut"></div>
+  </div>
+
+  <!-- CREATE SCORE CARD -->
+  <div class="panel wide">
+    <h2>2. Create Score Card</h2>
+
+    <div class="row">
+      <div>
+        <label>Application ID</label>
+        <input type="text" id="applicationId" value="">
+      </div>
+      <div style="flex:0 0 auto; align-self:flex-end;">
+        <button class="btn secondary small" id="genAppId" style="margin-top:0;">Generate</button>
+      </div>
+    </div>
+
+    <div class="row">
+      <div><label>Chit Value / Loan Amount</label><input type="number" id="chitValue" value="900000"></div>
+      <div><label>Future Liability</label><input type="number" id="futureLiability" value="800000"></div>
+    </div>
+    <div class="row">
+      <div><label>Gross Monthly Income</label><input type="number" id="grossMonthlyIncome" value="50000"></div>
+      <div><label>Existing Obligations</label><input type="number" id="existingObligations" value="5000"></div>
+      <div><label>Proposed EMI</label><input type="number" id="proposedEmi" value="8000"></div>
+    </div>
+    <label><input type="checkbox" id="documentsComplete" checked style="width:auto;display:inline-block;vertical-align:middle;"> Documents Complete</label>
+
+    <fieldset>
+      <legend>Subscriber</legend>
+      <div class="row">
+        <div><label>Name</label><input type="text" id="subName" value="Ramesh Gopalakrishnan"></div>
+        <div>
+          <label>Employment Type</label>
+          <select id="subEmploymentType">
+            <option>Salaried-Govt</option><option>Salaried-PSU</option><option selected>Salaried-Private</option>
+            <option>Business</option><option>Self Employed - Professional</option><option>Agriculture</option><option>Other</option>
+          </select>
+        </div>
+        <div id="subEntityWrap" style="display:none;">
+          <label>Entity Type</label>
+          <select id="subEntityType"><option>PvtLtd</option><option>Partnership</option><option>Proprietorship</option></select>
+        </div>
+      </div>
+      <div class="row">
+        <div><label>CIBIL Score (bureau-fetched)</label><input type="number" id="subCreditScore" value="748"></div>
+        <div><label>Worst DPD Days (bureau-fetched)</label><input type="number" id="subDpd" value="0"></div>
+        <div><label>Enquiries, 6mo (bureau-fetched)</label><input type="number" id="subEnquiry" value="3"></div>
+      </div>
+      <div class="row">
+        <div><label>Gross Income (optional)</label><input type="number" id="subGrossIncome" value=""></div>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Guarantor <span class="hint">(optional — only the first feeds Guarantor Quality)</span></legend>
+      <label><input type="checkbox" id="hasGuarantor" style="width:auto;display:inline-block;"> Include a guarantor</label>
+      <div id="guarantorFields" style="display:none;">
+        <div class="row">
+          <div><label>Name</label><input type="text" id="gName" value="Savithri Ramesh"></div>
+          <div>
+            <label>Employment Type</label>
+            <select id="gEmploymentType">
+              <option>Salaried-Govt</option><option>Salaried-PSU</option><option>Salaried-Private</option>
+              <option>Business</option><option>Self Employed - Professional</option><option>Agriculture</option><option selected>Other</option>
+            </select>
+          </div>
+        </div>
+        <div class="row">
+          <div><label>CIBIL Score</label><input type="number" id="gCreditScore" value="650"></div>
+          <div><label>Gross Income</label><input type="number" id="gGrossIncome" value="28000"></div>
+        </div>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Security</legend>
+      <label>Security Type</label>
+      <select id="securityType">
+        <option>Gold Ornaments</option><option>LIC Policy</option><option>Bank Guarantee</option>
+        <option>Fixed Deposit</option><option>Sub-Debt</option><option>Mortgage (Property)</option>
+        <option>Chit Passbook</option><option>Demat NCD</option><option>Demat Shares</option><option>Personal Surety</option>
+      </select>
+      <div id="secFields"></div>
+    </fieldset>
+
+    <button class="btn" id="createBtn">POST /score-cards</button>
+  </div>
+
+  <!-- ACTIONS -->
+  <div class="panel wide">
+    <h2>3. Actions on a Score Card</h2>
+    <div class="idfield">
+      <div style="flex:1"><label>Score Card ID (internal UUID)</label><input type="text" id="scId"></div>
+      <div style="flex:1"><label>...or Application ID</label><input type="text" id="scAppId"></div>
+      <button class="btn secondary small" id="lookupByAppId" style="margin:0 0 0 6px;">Lookup by App ID</button>
+    </div>
+    <div class="btn-row">
+      <button class="btn small secondary" data-action="get">GET</button>
+      <button class="btn small secondary" data-action="validate">Validate</button>
+      <button class="btn small secondary" data-action="submit">Submit</button>
+      <button class="btn small secondary" data-action="approve">Approve</button>
+      <button class="btn small secondary" data-action="reject">Reject</button>
+      <button class="btn small secondary" data-action="recalculate">Recalculate</button>
+      <button class="btn small secondary" data-action="summary">Summary</button>
+      <button class="btn small secondary" data-action="history">History</button>
+      <button class="btn small secondary" data-action="audit-logs">Audit Logs</button>
+      <button class="btn small danger" data-action="delete">Delete</button>
+    </div>
+    <div class="row" style="margin-top:8px;">
+      <div><label>Rejection Reason (for Reject)</label><input type="text" id="rejectionReason" value="CIBIL below policy threshold without adequate mitigant"></div>
+      <div><label>Remarks (for Approve, optional)</label><input type="text" id="approveRemarks" value="Looks good"></div>
+    </div>
+  </div>
+
+  <!-- RESPONSE -->
+  <div class="panel wide">
+    <div class="resp-meta">
+      <h2 style="margin:0;">Response</h2>
+      <span class="resp-status" id="respStatus"></span>
+    </div>
+    <pre id="responseBox">// responses appear here</pre>
+  </div>
+
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+function apiBase() { return $('apiBase').value.replace(/\/$/, ''); }
+function token() { return localStorage.getItem('sc_token') || ''; }
+function setToken(t) { t ? localStorage.setItem('sc_token', t) : localStorage.removeItem('sc_token'); }
+
+function showResponse(status, body) {
+  $('respStatus').textContent = status;
+  $('respStatus').className = 'resp-status ' + (status >= 200 && status < 300 ? 's2' : status >= 400 ? (status >= 500 ? 's5' : 's4') : '');
+  $('responseBox').textContent = typeof body === 'string' ? body : JSON.stringify(body, null, 2);
+}
+
+async function call(method, path, body) {
+  try {
+    const res = await fetch(apiBase() + path, {
+      method,
+      headers: Object.assign(
+        { 'Content-Type': 'application/json' },
+        token() ? { Authorization: 'Bearer ' + token() } : {}
+      ),
+      body: body !== undefined ? JSON.stringify(body) : undefined
+    });
+    let json;
+    try { json = await res.json(); } catch (e) { json = { note: 'no JSON body (status ' + res.status + ')' }; }
+    showResponse(res.status, json);
+    return { status: res.status, body: json };
+  } catch (err) {
+    showResponse(0, { networkError: err.message, hint: 'Check the API base URL and that CORS is enabled on the server.' });
+    return { status: 0, body: null };
+  }
+}
+
+// ---- health check ----
+$('pingBtn').addEventListener('click', async () => {
+  const { status, body } = await call('GET', '/health');
+  const badge = $('healthBadge');
+  if (status === 200 && body && body.data && body.data.status === 'UP') {
+    badge.textContent = 'UP'; badge.className = 'badge up';
+  } else {
+    badge.textContent = 'DOWN'; badge.className = 'badge down';
+  }
+});
+
+// ---- login ----
+document.querySelectorAll('[data-emp]').forEach((btn) => {
+  btn.addEventListener('click', () => { $('employeeId').value = btn.dataset.emp; });
+});
+
+$('loginBtn').addEventListener('click', async () => {
+  const { status, body } = await call('POST', '/api/v1/auth/login', {
+    employeeId: $('employeeId').value,
+    password: $('password').value
+  });
+  if (status === 200 && body.data && body.data.accessToken) {
+    setToken(body.data.accessToken);
+    $('currentUser').innerHTML = 'Logged in as <b>' + body.data.user.fullName + '</b> (' + body.data.user.role + ', ' + body.data.user.employeeId + ')';
+  } else {
+    setToken(null);
+    $('currentUser').textContent = 'Login failed — see response below.';
+  }
+});
+
+// ---- masters ----
+document.querySelectorAll('[data-master]').forEach((btn) => {
+  btn.addEventListener('click', async () => {
+    const { status, body } = await call('GET', '/api/v1/masters/' + btn.dataset.master);
+    if (status === 200 && Array.isArray(body.data)) {
+      const rows = body.data;
+      const keys = Object.keys(rows[0] || {});
+      let html = '<table><tr>' + keys.map((k) => '<th>' + k + '</th>').join('') + '</tr>';
+      for (const r of rows) html += '<tr>' + keys.map((k) => '<td>' + r[k] + '</td>').join('') + '</tr>';
+      html += '</table>';
+      $('mastersOut').innerHTML = html;
+    }
+  });
+});
+
+// ---- application id generator ----
+$('genAppId').addEventListener('click', () => {
+  const n = Math.floor(Math.random() * 900000) + 100000;
+  $('applicationId').value = 'MCF-2024-' + n;
+});
+$('genAppId').click();
+
+// ---- subscriber entity type visibility ----
+$('subEmploymentType').addEventListener('change', () => {
+  $('subEntityWrap').style.display = $('subEmploymentType').value === 'Business' ? 'block' : 'none';
+});
+
+// ---- guarantor toggle ----
+$('hasGuarantor').addEventListener('change', () => {
+  $('guarantorFields').style.display = $('hasGuarantor').checked ? 'block' : 'none';
+});
+
+// ---- security type dynamic fields ----
+const SECURITY_FIELD_DEFS = {
+  'Gold Ornaments': [
+    { id: 'netWeightGrams', label: 'Net Weight (grams)', value: 98 },
+    { id: 'ratePerGram', label: 'Rate per Gram', value: 6200 }
+  ],
+  'LIC Policy': [{ id: 'surrenderValue', label: 'Surrender Value', value: 250000 }],
+  'Bank Guarantee': [{ id: 'faceValue', label: 'Face Value', value: 500000 }],
+  'Fixed Deposit': [{ id: 'faceValue', label: 'Face Value', value: 500000 }],
+  'Demat NCD': [{ id: 'faceValue', label: 'Face Value', value: 400000 }],
+  'Sub-Debt': [
+    { id: 'apiSourcedValue', label: 'API-Sourced Value', value: 275000 },
+    { id: 'maturityDate', label: 'Maturity Date', value: '2028-01-01', type: 'date' }
+  ],
+  'Chit Passbook': [{ id: 'apiSourcedValue', label: 'API-Sourced Value', value: 120000 }],
+  'Mortgage (Property)': [{ id: 'forcedSaleValue', label: 'Forced Sale Value', value: 3000000 }],
+  'Demat Shares': [
+    { id: 'marketValue', label: 'Market Value', value: 1000000 },
+    { id: 'liabilityToSecure', label: 'Liability to Secure', value: 300000 }
+  ],
+  'Personal Surety': []
+};
+
+function renderSecurityFields() {
+  const type = $('securityType').value;
+  const defs = SECURITY_FIELD_DEFS[type] || [];
+  $('secFields').innerHTML = defs.map((d) =>
+    '<label>' + d.label + '</label><input type="' + (d.type || 'number') + '" id="sec_' + d.id + '" value="' + d.value + '">'
+  ).join('') || '<div class="hint">No security value inputs for this type.</div>';
+}
+$('securityType').addEventListener('change', renderSecurityFields);
+renderSecurityFields();
+
+// ---- create score card ----
+$('createBtn').addEventListener('click', async () => {
+  const subscriber = {
+    name: $('subName').value,
+    employmentType: $('subEmploymentType').value,
+    creditScore: $('subCreditScore').value ? Number($('subCreditScore').value) : null,
+    worstDpdDays: $('subDpd').value ? Number($('subDpd').value) : null,
+    enquiryCount6Months: $('subEnquiry').value ? Number($('subEnquiry').value) : null
+  };
+  if ($('subEmploymentType').value === 'Business') subscriber.entityType = $('subEntityType').value;
+  if ($('subGrossIncome').value) subscriber.grossIncome = Number($('subGrossIncome').value);
+
+  const guarantors = [];
+  if ($('hasGuarantor').checked) {
+    guarantors.push({
+      name: $('gName').value,
+      employmentType: $('gEmploymentType').value,
+      creditScore: $('gCreditScore').value ? Number($('gCreditScore').value) : null,
+      grossIncome: $('gGrossIncome').value ? Number($('gGrossIncome').value) : undefined
+    });
+  }
+
+  const type = $('securityType').value;
+  const security = { securityType: type };
+  (SECURITY_FIELD_DEFS[type] || []).forEach((d) => {
+    const el = $('sec_' + d.id);
+    security[d.id] = d.type === 'date' ? el.value : Number(el.value);
+  });
+
+  const payload = {
+    applicationId: $('applicationId').value,
+    chitValue: Number($('chitValue').value),
+    futureLiability: Number($('futureLiability').value),
+    documentsComplete: $('documentsComplete').checked,
+    grossMonthlyIncome: Number($('grossMonthlyIncome').value),
+    existingObligations: Number($('existingObligations').value),
+    proposedEmi: Number($('proposedEmi').value),
+    subscriber,
+    guarantors,
+    securities: [security]
+  };
+
+  const { status, body } = await call('POST', '/api/v1/score-cards', payload);
+  if (status === 201 && body.data && body.data.id) {
+    $('scId').value = body.data.id;
+    $('scAppId').value = body.data.applicationId;
+  }
+});
+
+// ---- lookup by application id ----
+$('lookupByAppId').addEventListener('click', async () => {
+  const appId = $('scAppId').value.trim();
+  if (!appId) return;
+  const { status, body } = await call('GET', '/api/v1/score-cards/application/' + encodeURIComponent(appId));
+  if (status === 200 && body.data && body.data.id) $('scId').value = body.data.id;
+});
+
+// ---- lifecycle actions ----
+document.querySelectorAll('[data-action]').forEach((btn) => {
+  btn.addEventListener('click', async () => {
+    const id = $('scId').value.trim();
+    if (!id) { showResponse(0, { error: 'Enter a Score Card ID first (create one above, or use "Lookup by App ID").' }); return; }
+    const action = btn.dataset.action;
+    const base = '/api/v1/score-cards/' + encodeURIComponent(id);
+    switch (action) {
+      case 'get': return call('GET', base);
+      case 'validate': return call('POST', base + '/validate');
+      case 'submit': return call('POST', base + '/submit');
+      case 'approve': return call('POST', base + '/approve', { remarks: $('approveRemarks').value });
+      case 'reject': return call('POST', base + '/reject', { rejectionReason: $('rejectionReason').value });
+      case 'recalculate': return call('POST', base + '/recalculate');
+      case 'summary': return call('GET', base + '/summary');
+      case 'history': return call('GET', base + '/history');
+      case 'audit-logs': return call('GET', base + '/audit-logs');
+      case 'delete': return call('DELETE', base);
+    }
+  });
+});
+
+// auto-ping on load
+$('pingBtn').click();
+</script>
+</body>
+</html>
