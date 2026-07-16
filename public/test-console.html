@@ -89,11 +89,17 @@
     <h2>Dropdown Masters</h2>
     <div class="btn-row">
       <button class="btn small secondary" data-master="security-types">Security Types</button>
-      <button class="btn small secondary" data-master="score-bands">Score Bands</button>
-      <button class="btn small secondary" data-master="employment-types">Employment Types</button>
-      <button class="btn small secondary" data-master="entity-types">Entity Types</button>
       <button class="btn small secondary" data-master="document-types">Document Types</button>
       <button class="btn small secondary" data-master="roles">Roles</button>
+    </div>
+    <div class="row" style="margin-top:8px;">
+      <div>
+        <label>Credit Score Parameters — Profile</label>
+        <select id="mastersProfileType"><option>SALARIED</option><option>BUSINESS</option></select>
+      </div>
+      <div style="flex:0 0 auto; align-self:flex-end;">
+        <button class="btn small secondary" id="mastersParamsBtn" style="margin-top:0;">Load Parameters</button>
+      </div>
     </div>
     <div class="masters-out" id="mastersOut"></div>
   </div>
@@ -116,11 +122,6 @@
       <div><label>Chit Value / Loan Amount</label><input type="number" id="chitValue" value="900000"></div>
       <div><label>Future Liability</label><input type="number" id="futureLiability" value="800000"></div>
     </div>
-    <div class="row">
-      <div><label>Gross Monthly Income</label><input type="number" id="grossMonthlyIncome" value="50000"></div>
-      <div><label>Existing Obligations</label><input type="number" id="existingObligations" value="5000"></div>
-      <div><label>Proposed EMI</label><input type="number" id="proposedEmi" value="8000"></div>
-    </div>
     <label><input type="checkbox" id="documentsComplete" checked style="width:auto;display:inline-block;vertical-align:middle;"> Documents Complete</label>
 
     <fieldset>
@@ -128,45 +129,26 @@
       <div class="row">
         <div><label>Name</label><input type="text" id="subName" value="Ramesh Gopalakrishnan"></div>
         <div>
-          <label>Employment Type</label>
-          <select id="subEmploymentType">
-            <option>Salaried-Govt</option><option>Salaried-PSU</option><option selected>Salaried-Private</option>
-            <option>Business</option><option>Self Employed - Professional</option><option>Agriculture</option><option>Other</option>
-          </select>
-        </div>
-        <div id="subEntityWrap" style="display:none;">
-          <label>Entity Type</label>
-          <select id="subEntityType"><option>PvtLtd</option><option>Partnership</option><option>Proprietorship</option></select>
+          <label>Profile Type</label>
+          <select id="subProfileType"><option selected>SALARIED</option><option>BUSINESS</option></select>
         </div>
       </div>
-      <div class="row">
-        <div><label>CIBIL Score (bureau-fetched)</label><input type="number" id="subCreditScore" value="748"></div>
-        <div><label>Worst DPD Days (bureau-fetched)</label><input type="number" id="subDpd" value="0"></div>
-        <div><label>Enquiries, 6mo (bureau-fetched)</label><input type="number" id="subEnquiry" value="3"></div>
-      </div>
-      <div class="row">
-        <div><label>Gross Income (optional)</label><input type="number" id="subGrossIncome" value=""></div>
-      </div>
+      <div class="hint">Parameters load from <code>GET /masters/credit-score-parameters</code> for the selected profile — see Credit Score.xlsx.</div>
+      <div id="subParamsOut"></div>
     </fieldset>
 
     <fieldset>
-      <legend>Guarantor <span class="hint">(optional — only the first feeds Guarantor Quality)</span></legend>
+      <legend>Guarantor <span class="hint">(optional — scored independently, may use either profile)</span></legend>
       <label><input type="checkbox" id="hasGuarantor" style="width:auto;display:inline-block;"> Include a guarantor</label>
       <div id="guarantorFields" style="display:none;">
         <div class="row">
           <div><label>Name</label><input type="text" id="gName" value="Savithri Ramesh"></div>
           <div>
-            <label>Employment Type</label>
-            <select id="gEmploymentType">
-              <option>Salaried-Govt</option><option>Salaried-PSU</option><option>Salaried-Private</option>
-              <option>Business</option><option>Self Employed - Professional</option><option>Agriculture</option><option selected>Other</option>
-            </select>
+            <label>Profile Type</label>
+            <select id="gProfileType"><option>SALARIED</option><option selected>BUSINESS</option></select>
           </div>
         </div>
-        <div class="row">
-          <div><label>CIBIL Score</label><input type="number" id="gCreditScore" value="650"></div>
-          <div><label>Gross Income</label><input type="number" id="gGrossIncome" value="28000"></div>
-        </div>
+        <div id="gParamsOut"></div>
       </div>
     </fieldset>
 
@@ -278,6 +260,8 @@ $('loginBtn').addEventListener('click', async () => {
   if (status === 200 && body.data && body.data.accessToken) {
     setToken(body.data.accessToken);
     $('currentUser').innerHTML = 'Logged in as <b>' + body.data.user.fullName + '</b> (' + body.data.user.role + ', ' + body.data.user.employeeId + ')';
+    renderPersonParams('sub');
+    if (gParamsLoaded) renderPersonParams('g');
   } else {
     setToken(null);
     $('currentUser').textContent = 'Login failed — see response below.';
@@ -299,6 +283,71 @@ document.querySelectorAll('[data-master]').forEach((btn) => {
   });
 });
 
+$('mastersParamsBtn').addEventListener('click', async () => {
+  const profileType = $('mastersProfileType').value;
+  const { status, body } = await call('GET', '/api/v1/masters/credit-score-parameters?profileType=' + profileType);
+  if (status === 200 && Array.isArray(body.data)) {
+    let html = '<table><tr><th>Sl No</th><th>Name</th><th>Category</th><th>Max Score</th><th>Options</th></tr>';
+    for (const p of body.data) {
+      html += '<tr><td>' + p.slNo + '</td><td>' + p.name + '</td><td>' + p.category + '</td><td>' + p.maxScore + '</td><td>' + (p.options ? p.options.length : 0) + '</td></tr>';
+    }
+    html += '</table>';
+    $('mastersOut').innerHTML = html;
+  }
+});
+
+// ---- Credit Score parameter matrix (per person: 'sub' or 'g') ----
+const personDefs = {}; // prefix -> array of parameterDefs loaded from the API
+
+function renderPersonParams(prefix) {
+  const profileType = $(prefix === 'sub' ? 'subProfileType' : 'gProfileType').value;
+  const container = $(prefix + 'ParamsOut');
+  container.innerHTML = '<div class="hint">Loading ' + profileType + ' parameters…</div>';
+  call('GET', '/api/v1/masters/credit-score-parameters?profileType=' + profileType).then(({ status, body }) => {
+    if (status !== 200 || !Array.isArray(body.data)) {
+      container.innerHTML = '<div class="hint">Failed to load parameters — see Response panel.</div>';
+      return;
+    }
+    personDefs[prefix] = body.data;
+    let html = '';
+    for (const p of body.data) {
+      if (p.category === 'QUANTITATIVE') {
+        html += '<label>' + p.slNo + '. ' + p.name + ' (max ' + p.maxScore + ')</label>';
+        html += '<select id="' + prefix + '_param_' + p.id + '" data-param-id="' + p.id + '" data-category="QUANTITATIVE">';
+        html += '<option value="">-- not answered (draft) --</option>';
+        for (const o of p.options) html += '<option value="' + o.id + '">' + o.label + ' (' + o.weightage + ')</option>';
+        html += '</select>';
+      } else {
+        html += '<label style="margin-top:6px;">';
+        html += '<input type="checkbox" id="' + prefix + '_param_' + p.id + '" data-param-id="' + p.id + '" data-category="QUALITATIVE" style="width:auto;display:inline-block;vertical-align:middle;">';
+        html += ' ' + p.slNo + '. ' + p.name + ' (penalty ' + p.maxScore + ')';
+        html += '</label>';
+      }
+    }
+    container.innerHTML = html;
+  });
+}
+
+/** Reads the rendered <select>/<input> elements for a person and builds their responses[] payload. */
+function buildResponses(prefix) {
+  const defs = personDefs[prefix] || [];
+  const responses = [];
+  for (const p of defs) {
+    const el = $(prefix + '_param_' + p.id);
+    if (!el) continue;
+    if (p.category === 'QUANTITATIVE') {
+      if (el.value) responses.push({ parameterId: p.id, selectedOptionId: Number(el.value) });
+    } else {
+      responses.push({ parameterId: p.id, qualitativeFlag: el.checked });
+    }
+  }
+  return responses;
+}
+
+$('subProfileType').addEventListener('change', () => renderPersonParams('sub'));
+$('gProfileType').addEventListener('change', () => renderPersonParams('g'));
+if (token()) renderPersonParams('sub');
+
 // ---- application id generator ----
 $('genAppId').addEventListener('click', () => {
   const n = Math.floor(Math.random() * 900000) + 100000;
@@ -306,14 +355,14 @@ $('genAppId').addEventListener('click', () => {
 });
 $('genAppId').click();
 
-// ---- subscriber entity type visibility ----
-$('subEmploymentType').addEventListener('change', () => {
-  $('subEntityWrap').style.display = $('subEmploymentType').value === 'Business' ? 'block' : 'none';
-});
-
 // ---- guarantor toggle ----
+let gParamsLoaded = false;
 $('hasGuarantor').addEventListener('change', () => {
   $('guarantorFields').style.display = $('hasGuarantor').checked ? 'block' : 'none';
+  if ($('hasGuarantor').checked && !gParamsLoaded) {
+    gParamsLoaded = true;
+    renderPersonParams('g');
+  }
 });
 
 // ---- security type dynamic fields ----
@@ -351,23 +400,21 @@ renderSecurityFields();
 
 // ---- create score card ----
 $('createBtn').addEventListener('click', async () => {
+  if (!personDefs.sub) { showResponse(0, { error: 'Subscriber parameters have not loaded yet — log in first, then wait for the parameter list to appear.' }); return; }
+
   const subscriber = {
     name: $('subName').value,
-    employmentType: $('subEmploymentType').value,
-    creditScore: $('subCreditScore').value ? Number($('subCreditScore').value) : null,
-    worstDpdDays: $('subDpd').value ? Number($('subDpd').value) : null,
-    enquiryCount6Months: $('subEnquiry').value ? Number($('subEnquiry').value) : null
+    profileType: $('subProfileType').value,
+    responses: buildResponses('sub')
   };
-  if ($('subEmploymentType').value === 'Business') subscriber.entityType = $('subEntityType').value;
-  if ($('subGrossIncome').value) subscriber.grossIncome = Number($('subGrossIncome').value);
 
   const guarantors = [];
   if ($('hasGuarantor').checked) {
+    if (!personDefs.g) { showResponse(0, { error: 'Guarantor parameters have not loaded yet — wait for the parameter list to appear.' }); return; }
     guarantors.push({
       name: $('gName').value,
-      employmentType: $('gEmploymentType').value,
-      creditScore: $('gCreditScore').value ? Number($('gCreditScore').value) : null,
-      grossIncome: $('gGrossIncome').value ? Number($('gGrossIncome').value) : undefined
+      profileType: $('gProfileType').value,
+      responses: buildResponses('g')
     });
   }
 
@@ -383,9 +430,6 @@ $('createBtn').addEventListener('click', async () => {
     chitValue: Number($('chitValue').value),
     futureLiability: Number($('futureLiability').value),
     documentsComplete: $('documentsComplete').checked,
-    grossMonthlyIncome: Number($('grossMonthlyIncome').value),
-    existingObligations: Number($('existingObligations').value),
-    proposedEmi: Number($('proposedEmi').value),
     subscriber,
     guarantors,
     securities: [security]
