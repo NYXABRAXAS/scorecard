@@ -2,8 +2,8 @@
 
 /**
  * Integration tests against a real Postgres instance.
- * Prerequisites: db/schema.sql and db/seed.sql already applied to the database
- * pointed at by .env (see package.json's "db:migrate"/"db:seed" scripts).
+ * Prerequisites: db/schema.sql, db/seed.sql AND db/seed_credit_score.sql already
+ * applied to the database pointed at by .env (see package.json's "db:migrate"/"db:seed" scripts).
  */
 
 const request = require('supertest');
@@ -13,9 +13,25 @@ const { pool } = require('../src/config/db');
 let biToken;
 let fcToken;
 let devToken;
+let salariedParams; // GET /masters/credit-score-parameters?profileType=SALARIED response
+let businessParams;
 
-const validSubscriber = { name: 'Ramesh Gopalakrishnan', employmentType: 'Salaried-Private', creditScore: 748 };
 const validSecurity = { securityType: 'Gold Ornaments', netWeightGrams: 150, ratePerGram: 6000 }; // -> valueLoaded 900000
+
+/** Answers every parameter for a profile: first option for each QUANTITATIVE, false for each QUALITATIVE. */
+function answerAll(params, { skipParamNamePattern } = {}) {
+  return params
+    .filter((p) => !skipParamNamePattern || !skipParamNamePattern.test(p.name))
+    .map((p) => (
+      p.category === 'QUANTITATIVE'
+        ? { parameterId: p.id, selectedOptionId: p.options[0].id }
+        : { parameterId: p.id, qualitativeFlag: false }
+    ));
+}
+
+function subscriberPayload(overrides = {}) {
+  return { name: 'Ramesh Gopalakrishnan', profileType: 'SALARIED', responses: answerAll(salariedParams), ...overrides };
+}
 
 function scoreCardPayload(overrides = {}) {
   return {
@@ -23,10 +39,7 @@ function scoreCardPayload(overrides = {}) {
     chitValue: 900000,
     futureLiability: 800000,
     documentsComplete: true,
-    grossMonthlyIncome: 50000,
-    existingObligations: 5000,
-    proposedEmi: 8000,
-    subscriber: validSubscriber,
+    subscriber: subscriberPayload(),
     guarantors: [],
     securities: [validSecurity],
     ...overrides
@@ -42,6 +55,11 @@ beforeAll(async () => {
   biToken = await login('EMP-1001');
   fcToken = await login('EMP-1042');
   devToken = await login('EMP-1005');
+
+  const salariedRes = await request(app).get('/api/v1/masters/credit-score-parameters').query({ profileType: 'SALARIED' }).set('Authorization', `Bearer ${biToken}`);
+  salariedParams = salariedRes.body.data;
+  const businessRes = await request(app).get('/api/v1/masters/credit-score-parameters').query({ profileType: 'BUSINESS' }).set('Authorization', `Bearer ${biToken}`);
+  businessParams = businessRes.body.data;
 });
 
 afterAll(async () => {
@@ -85,12 +103,47 @@ describe('Authentication & authorization guards', () => {
   });
 });
 
+describe('GET /api/v1/masters/credit-score-parameters (SALARIED / BUSINESS dropdown matrix)', () => {
+  test('SALARIED returns 13 QUANTITATIVE + 7 QUALITATIVE parameters, max scores summing to 100', () => {
+    const quantitative = salariedParams.filter((p) => p.category === 'QUANTITATIVE');
+    const qualitative = salariedParams.filter((p) => p.category === 'QUALITATIVE');
+    expect(quantitative.length).toBe(13);
+    expect(qualitative.length).toBe(7);
+    expect(quantitative.reduce((sum, p) => sum + p.maxScore, 0)).toBe(100);
+    expect(quantitative.every((p) => p.options.length > 0)).toBe(true);
+  });
+
+  test('BUSINESS returns 14 QUANTITATIVE + 7 QUALITATIVE parameters, max scores summing to 100', () => {
+    const quantitative = businessParams.filter((p) => p.category === 'QUANTITATIVE');
+    const qualitative = businessParams.filter((p) => p.category === 'QUALITATIVE');
+    expect(quantitative.length).toBe(14);
+    expect(qualitative.length).toBe(7);
+    expect(quantitative.reduce((sum, p) => sum + p.maxScore, 0)).toBe(100);
+  });
+
+  test('rejects a profileType outside SALARIED/BUSINESS', async () => {
+    const res = await request(app).get('/api/v1/masters/credit-score-parameters').query({ profileType: 'RETIRED' }).set('Authorization', `Bearer ${biToken}`);
+    expect(res.status).toBe(400);
+  });
+});
+
 describe('POST /api/v1/score-cards (Create Score Card)', () => {
   test('creates a valid score card as BI', async () => {
     const res = await request(app).post('/api/v1/score-cards').set('Authorization', `Bearer ${biToken}`).send(scoreCardPayload());
     expect(res.status).toBe(201);
     expect(res.body.data.status).toBe('DRAFT');
     expect(res.body.data.applicationId).toMatch(/^MCF-\d{4}-\d{6}$/);
+    expect(res.body.data.subscriber.profileType).toBe('SALARIED');
+    expect(typeof res.body.data.subscriber.totalScore).toBe('number');
+  });
+
+  test('creates a valid score card for a BUSINESS-profile subscriber', async () => {
+    const res = await request(app)
+      .post('/api/v1/score-cards')
+      .set('Authorization', `Bearer ${biToken}`)
+      .send(scoreCardPayload({ subscriber: { name: 'Business Owner', profileType: 'BUSINESS', responses: answerAll(businessParams) } }));
+    expect(res.status).toBe(201);
+    expect(res.body.data.subscriber.profileType).toBe('BUSINESS');
   });
 
   test('rejects a payload with an invalid applicationId format (validation error)', async () => {
@@ -110,6 +163,16 @@ describe('POST /api/v1/score-cards (Create Score Card)', () => {
     const second = await request(app).post('/api/v1/score-cards').set('Authorization', `Bearer ${biToken}`).send(payload);
     expect(second.status).toBe(409);
     expect(second.body.error.code).toBe('DUPLICATE_SCORE_CARD');
+  });
+
+  test('rejects a response whose selectedOptionId does not belong to the given parameter', async () => {
+    const badResponses = answerAll(salariedParams);
+    badResponses[0] = { ...badResponses[0], selectedOptionId: 999999999 };
+    const res = await request(app)
+      .post('/api/v1/score-cards')
+      .set('Authorization', `Bearer ${biToken}`)
+      .send(scoreCardPayload({ subscriber: subscriberPayload({ responses: badResponses }) }));
+    expect(res.status).toBe(422);
   });
 
   test('boundary: chitValue of exactly 0 is rejected (must be positive)', async () => {
@@ -149,9 +212,8 @@ describe('GET /api/v1/score-cards/:id and /application/:applicationId (Get Score
     expect(res.status).toBe(404);
   });
 
-  test('a different BI (own-only view) cannot read another BI\'s score card', async () => {
-    // EMP-1042 is FC (caseViewAll) so this specifically tests a caseViewOwn-only role boundary
-    // by asserting FC (view-all) CAN see it, establishing the contrast for the RBAC docs.
+  test('a different role (view-all) can read another BI\'s score card', async () => {
+    // EMP-1042 is FC (caseViewAll) so this tests the contrast against a caseViewOwn-only role boundary.
     const res = await request(app).get(`/api/v1/score-cards/${created.id}`).set('Authorization', `Bearer ${fcToken}`);
     expect(res.status).toBe(200);
   });
@@ -171,11 +233,12 @@ describe('Validate -> Submit lifecycle guards (documentsComplete, securityCovers
     expect(validateRes.body.data.failedGuards.some((g) => g.guard === 'securityCoversLiability')).toBe(true);
   });
 
-  test('validate fails when CIBIL is missing', async () => {
+  test('validate fails when CIBIL Score is unanswered', async () => {
+    const responses = answerAll(salariedParams, { skipParamNamePattern: /cibil/i });
     const createRes = await request(app)
       .post('/api/v1/score-cards')
       .set('Authorization', `Bearer ${biToken}`)
-      .send(scoreCardPayload({ subscriber: { ...validSubscriber, creditScore: null } }));
+      .send(scoreCardPayload({ subscriber: subscriberPayload({ responses }) }));
     const id = createRes.body.data.id;
 
     const validateRes = await request(app).post(`/api/v1/score-cards/${id}/validate`).set('Authorization', `Bearer ${biToken}`);
@@ -211,8 +274,8 @@ describe('Validate -> Submit lifecycle guards (documentsComplete, securityCovers
     const approveRes = await request(app).post(`/api/v1/score-cards/${id}/approve`).set('Authorization', `Bearer ${fcToken}`).send({ remarks: 'Looks good' });
     expect(approveRes.status).toBe(200);
     expect(approveRes.body.data.status).toBe('APPROVED');
-    expect(approveRes.body.data.scores.eligible).toBe(true);
-    expect(approveRes.body.data.scores.decisionText).toBe('Eligible for Approval');
+    expect(typeof approveRes.body.data.subscriber.totalScore).toBe('number');
+    expect(typeof approveRes.body.data.subscriber.totalFinalScore).toBe('number');
   });
 
   test('reject requires a rejectionReason of at least 5 characters', async () => {
@@ -226,7 +289,7 @@ describe('Validate -> Submit lifecycle guards (documentsComplete, securityCovers
 
     const goodReject = await request(app)
       .post(`/api/v1/score-cards/${id}/reject`)
-      .set('Authorization', `Bearer ${devToken === undefined ? fcToken : fcToken}`)
+      .set('Authorization', `Bearer ${fcToken}`)
       .send({ rejectionReason: 'CIBIL below policy threshold without adequate mitigant' });
     expect(goodReject.status).toBe(200);
     expect(goodReject.body.data.status).toBe('REJECTED');
@@ -245,6 +308,36 @@ describe('Validate -> Submit lifecycle guards (documentsComplete, securityCovers
     expect(updateRes.status).toBe(200);
     expect(updateRes.body.data.status).toBe('DRAFT');
   });
+
+  test('updating the subscriber\'s responses recomputes their totalScore', async () => {
+    const createRes = await request(app).post('/api/v1/score-cards').set('Authorization', `Bearer ${biToken}`).send(scoreCardPayload());
+    const id = createRes.body.data.id;
+    const before = createRes.body.data.subscriber.totalScore;
+
+    const cibilParam = salariedParams.find((p) => /cibil/i.test(p.name));
+    const bestOption = cibilParam.options.reduce((best, o) => (o.weightage > best.weightage ? o : best));
+    const responses = answerAll(salariedParams).map((r) => (r.parameterId === cibilParam.id ? { parameterId: cibilParam.id, selectedOptionId: bestOption.id } : r));
+
+    const updateRes = await request(app)
+      .put(`/api/v1/score-cards/${id}`)
+      .set('Authorization', `Bearer ${biToken}`)
+      .send({ subscriber: subscriberPayload({ responses }) });
+    expect(updateRes.status).toBe(200);
+    expect(updateRes.body.data.subscriber.totalScore).toBeGreaterThanOrEqual(before);
+  });
+
+  test('PATCH draft can be saved with only a subset of parameters answered (partial/in-progress state)', async () => {
+    const createRes = await request(app).post('/api/v1/score-cards').set('Authorization', `Bearer ${biToken}`).send(scoreCardPayload());
+    const id = createRes.body.data.id;
+    const partialResponses = [answerAll(salariedParams)[0]];
+
+    const draftRes = await request(app)
+      .patch(`/api/v1/score-cards/${id}/draft`)
+      .set('Authorization', `Bearer ${biToken}`)
+      .send({ subscriber: subscriberPayload({ responses: partialResponses }) });
+    expect(draftRes.status).toBe(200);
+    expect(draftRes.body.data.status).toBe('DRAFT');
+  });
 });
 
 describe('POST /api/v1/score-cards/:id/recalculate', () => {
@@ -254,7 +347,7 @@ describe('POST /api/v1/score-cards/:id/recalculate', () => {
     const res = await request(app).post(`/api/v1/score-cards/${id}/recalculate`).set('Authorization', `Bearer ${biToken}`);
     expect(res.status).toBe(200);
     expect(res.body.data.status).toBe('DRAFT');
-    expect(res.body.data.scores.finalWeightedScore).not.toBeNull();
+    expect(typeof res.body.data.subscriber.totalFinalScore).toBe('number');
   });
 
   test('cannot recalculate an APPROVED card', async () => {
@@ -301,12 +394,13 @@ describe('GET /api/v1/score-cards/:id/summary, /history, /audit-logs', () => {
     await request(app).post(`/api/v1/score-cards/${id}/validate`).set('Authorization', `Bearer ${biToken}`);
   });
 
-  test('summary reflects guard status and decision', async () => {
+  test('summary reflects per-person totals and guard status', async () => {
     const res = await request(app).get(`/api/v1/score-cards/${id}/summary`).set('Authorization', `Bearer ${biToken}`);
     expect(res.status).toBe(200);
     expect(res.body.data.readyToSubmit).toBe(true);
-    expect(res.body.data.eligible).toBe(true);
-    expect(res.body.data.decisionText).toBe('Eligible for Approval');
+    expect(res.body.data.subscriber.profileType).toBe('SALARIED');
+    expect(typeof res.body.data.subscriber.totalScore).toBe('number');
+    expect(res.body.data.guardStatus.cibilComplete).toBe(true);
   });
 
   test('history contains a snapshot per lifecycle transition, newest first', async () => {
@@ -351,12 +445,6 @@ describe('GET /api/v1/masters/* (Get Dropdown Masters)', () => {
     expect(res.status).toBe(200);
     expect(res.body.data.length).toBe(10);
     expect(res.body.data.find((s) => s.securityType === 'Gold Ornaments').ltvCap).toBeCloseTo(0.75);
-  });
-
-  test('score-bands returns the 3 decision bands (Eligible / Conditional / Not Eligible)', async () => {
-    const res = await request(app).get('/api/v1/masters/score-bands').set('Authorization', `Bearer ${biToken}`);
-    expect(res.status).toBe(200);
-    expect(res.body.data.map((b) => b.bandCode)).toEqual(['ELIGIBLE', 'CONDITIONAL', 'NOT_ELIGIBLE']);
   });
 
   test('masters require authentication', async () => {

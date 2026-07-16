@@ -30,13 +30,6 @@ INSERT INTO security_type_master (security_type, category, is_secured, ltv_cap, 
   ('Demat Shares',       'Primary',     TRUE,  0.60, 'Credit Head'),
   ('Personal Surety',    'Guarantee',   FALSE, NULL, 'Branch Manager');
 
--- 6-factor Score Card decision thresholds — engineering defaults, confirm with
--- Credit Policy after local testing (see DOCUMENTATION.md Section 6).
-INSERT INTO scorecard_decision_band_master (min_score, max_score, band_code, label, decision_text, display_order) VALUES
-  (75,  100, 'ELIGIBLE',     'Eligible',              'Eligible for Approval',              1),
-  (60,  74.99,'CONDITIONAL', 'Conditional',           'Conditional - Manual Review Required', 2),
-  (0,   59.99,'NOT_ELIGIBLE','Not Eligible',          'Not Eligible',                        3);
-
 -- A minimal set of demo users, one per role, for local development / Swagger try-it-out.
 -- password_hash below is bcrypt('Password@123', 10) — CHANGE before any non-local use.
 INSERT INTO app_user (employee_id, full_name, role_code, branch_code, password_hash) VALUES

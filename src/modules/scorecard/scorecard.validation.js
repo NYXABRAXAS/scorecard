@@ -2,34 +2,33 @@
 
 const Joi = require('joi');
 
-const EMPLOYMENT_TYPES = [
-  'Salaried-Govt', 'Salaried-PSU', 'Salaried-Private',
-  'Business', 'Self Employed - Professional', 'Agriculture', 'Other'
-];
-const ENTITY_TYPES = ['PvtLtd', 'Partnership', 'Proprietorship'];
+/**
+ * One answered parameter for a person — see score_card_person_responses table.
+ * QUANTITATIVE parameters are answered by selecting exactly one option
+ * (selectedOptionId); QUALITATIVE parameters are a yes/no flag (qualitativeFlag).
+ * Exactly one of the two must be present per entry; which one is valid for a
+ * given parameterId is enforced downstream by creditScoreEngine.js against the
+ * parameter's actual category (a client cannot mix them up and have it silently
+ * accepted). A response array may be a partial subset of all parameters for a
+ * profile — unanswered parameters simply score 0 (draft-in-progress state).
+ */
+const personResponseSchema = Joi.object({
+  parameterId: Joi.number().integer().positive().required(),
+  selectedOptionId: Joi.number().integer().positive(),
+  qualitativeFlag: Joi.boolean()
+}).xor('selectedOptionId', 'qualitativeFlag');
 
 /**
- * One subscriber/guarantor person — see score_card_persons table.
- *
- * creditScore, worstDpdDays and enquiryCount6Months are bureau-fetched fields
- * (from the CIBIL/credit-bureau report pull) — they are meant to be populated by
- * an upstream bureau-integration call, not typed in manually by the Branch
- * Initiator at the Score Card step. See scoring.engine.js for how each factor
- * consumes them.
+ * One subscriber/guarantor person — see score_card_persons table. profileType
+ * selects which of the two independent score cards (Employee/Salaried or
+ * Business) this person's responses are validated and scored against; see
+ * db/seed_credit_score.sql / DOCUMENTATION.md Section 19 for the full
+ * Excel-to-parameter mapping.
  */
 const personSchema = Joi.object({
   name: Joi.string().trim().min(2).max(120).required(),
-  employmentType: Joi.string().valid(...EMPLOYMENT_TYPES).required(),
-  entityType: Joi.string().valid(...ENTITY_TYPES).when('employmentType', {
-    is: 'Business',
-    then: Joi.optional(),
-    otherwise: Joi.forbidden()
-  }),
-  creditScore: Joi.number().integer().min(300).max(900).allow(null),
-  worstDpdDays: Joi.number().integer().min(0).max(9999).allow(null),
-  enquiryCount6Months: Joi.number().integer().min(0).max(999).allow(null),
-  grossIncome: Joi.number().min(0).optional(),
-  netIncome: Joi.number().min(0).optional()
+  profileType: Joi.string().valid('SALARIED', 'BUSINESS').required(),
+  responses: Joi.array().items(personResponseSchema).unique('parameterId').default([])
 });
 
 /**
@@ -65,14 +64,9 @@ const securitySchema = Joi.object({
 const createScoreCardSchema = Joi.object({
   applicationId: Joi.string().pattern(/^MCF-\d{4}-\d{6}$/).required()
     .messages({ 'string.pattern.base': 'applicationId must match MCF-YYYY-NNNNNN' }),
-  chitValue: Joi.number().positive().required(), // also the proposed loan amount for Security Coverage
+  chitValue: Joi.number().positive().required(), // also the proposed loan amount for the Security Coverage guard
   futureLiability: Joi.number().positive().required(),
   documentsComplete: Joi.boolean().default(false),
-  // Income-EMI Coverage factor inputs — subscriber's income/obligations, carried
-  // over from earlier application-intake steps (not re-typed at the score card step).
-  grossMonthlyIncome: Joi.number().min(0).required(),
-  existingObligations: Joi.number().min(0).default(0),
-  proposedEmi: Joi.number().min(0).required(),
   subscriber: personSchema.required(),
   guarantors: Joi.array().items(personSchema).max(4).default([]),
   securities: Joi.array().items(securitySchema).min(1).required()
@@ -83,9 +77,6 @@ const updateScoreCardSchema = Joi.object({
   chitValue: Joi.number().positive(),
   futureLiability: Joi.number().positive(),
   documentsComplete: Joi.boolean(),
-  grossMonthlyIncome: Joi.number().min(0),
-  existingObligations: Joi.number().min(0),
-  proposedEmi: Joi.number().min(0),
   subscriber: personSchema,
   guarantors: Joi.array().items(personSchema).max(4),
   securities: Joi.array().items(securitySchema).min(1),
@@ -124,7 +115,6 @@ const listQuerySchema = Joi.object({
   page: Joi.number().integer().min(1).default(1),
   pageSize: Joi.number().integer().min(1).max(100).default(20),
   status: Joi.string().valid('DRAFT', 'VALIDATED', 'SUBMITTED', 'UNDER_REVIEW', 'APPROVED', 'REJECTED'),
-  eligible: Joi.boolean(),
   applicationId: Joi.string(),
   createdBy: Joi.number().integer(),
   sort: Joi.string().pattern(/^[a-z_]+:(asc|desc)$/i),
@@ -142,5 +132,6 @@ module.exports = {
   applicationIdParamSchema,
   listQuerySchema,
   personSchema,
+  personResponseSchema,
   securitySchema
 };

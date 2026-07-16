@@ -1,7 +1,7 @@
 {
   "name": "mcf-los-scorecard-api",
   "version": "1.0.0",
-  "description": "Score Card module REST API for the MCF Loan Origination System — subscriber/guarantor risk scoring per the Risk-Assessment Scoring Engine (Annexure 2).",
+  "description": "Score Card module REST API for the MCF Loan Origination System — subscriber/guarantor Credit Score matrix per Credit Score.xlsx (Employee/Salaried and Business profiles).",
   "main": "src/server.js",
   "private": true,
   "license": "UNLICENSED",
@@ -12,7 +12,7 @@
     "test:watch": "jest --watch",
     "lint": "eslint src tests",
     "db:migrate": "psql -f db/schema.sql",
-    "db:seed": "psql -f db/seed.sql"
+    "db:seed": "psql -f db/seed.sql && psql -f db/seed_credit_score.sql"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

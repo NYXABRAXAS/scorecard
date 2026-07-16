@@ -92,21 +92,17 @@ paths:
               chitValue: 6750000
               futureLiability: 6000000
               documentsComplete: true
-              grossMonthlyIncome: 35000
-              existingObligations: 5000
-              proposedEmi: 12000
               subscriber:
                 name: Meena Devi Nair
-                employmentType: Salaried-Govt
-                creditScore: 763
-                worstDpdDays: 0
-                enquiryCount6Months: 1
+                profileType: SALARIED
+                responses:
+                  - { parameterId: 1, selectedOptionId: 4 }
+                  - { parameterId: 8, selectedOptionId: 22 }
               guarantors:
                 - name: Sundar Meenakshisundaram
-                  employmentType: Business
-                  entityType: Proprietorship
-                  creditScore: 809
-                  grossIncome: 28000
+                  profileType: BUSINESS
+                  responses:
+                    - { parameterId: 15, selectedOptionId: 61 }
               securities:
                 - securityType: Chit Passbook
                   holderName: Kalaivani Natarajan
@@ -135,9 +131,6 @@ paths:
         - name: status
           in: query
           schema: { $ref: '#/components/schemas/Status' }
-        - name: eligible
-          in: query
-          schema: { type: boolean }
         - name: applicationId
           in: query
           schema: { type: string }
@@ -411,26 +404,30 @@ paths:
       responses:
         '200': { description: List of security types with LTV caps and approval authority }
 
-  /masters/score-bands:
+  /masters/credit-score-parameters:
     get:
       tags: [Masters]
-      summary: Get Dropdown Masters — CAM Risk Score Bands
+      summary: Get Credit Score Card parameter + option matrix for a profile (SALARIED or BUSINESS)
+      description: >
+        Sourced verbatim from Credit Score.xlsx (db/seed_credit_score.sql) — the
+        ordered list of QUANTITATIVE parameters (each with its dropdown options)
+        and QUALITATIVE parameters (fixed-penalty flags) for one profile. Drives
+        both the score card form UI and the request shape for score-card
+        subscriber/guarantor `responses[]`. See DOCUMENTATION.md Section 19.
+      parameters:
+        - name: profileType
+          in: query
+          required: true
+          schema: { type: string, enum: [SALARIED, BUSINESS] }
       responses:
-        '200': { description: A-D grade bands }
-
-  /masters/employment-types:
-    get:
-      tags: [Masters]
-      summary: Get Dropdown Masters — Employment Types
-      responses:
-        '200': { description: Employment type enum }
-
-  /masters/entity-types:
-    get:
-      tags: [Masters]
-      summary: Get Dropdown Masters — Business Entity Types
-      responses:
-        '200': { description: Entity type enum }
+        '200':
+          description: Ordered parameter list, each with nested options for QUANTITATIVE parameters
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/CreditScoreParameter' }
+        '400': { description: profileType missing or not SALARIED/BUSINESS }
 
   /masters/document-types:
     get:
@@ -514,22 +511,60 @@ components:
         role: { type: string }
         branchCode: { type: string, nullable: true }
 
+    CreditScoreParameterOption:
+      type: object
+      properties:
+        id: { type: integer }
+        label: { type: string }
+        weightage: { type: number, minimum: 0, maximum: 1 }
+        displayOrder: { type: integer }
+
+    CreditScoreParameter:
+      type: object
+      description: One row from Credit Score.xlsx, exactly as seeded — see DOCUMENTATION.md Section 19.
+      properties:
+        id: { type: integer }
+        profileType: { type: string, enum: [SALARIED, BUSINESS] }
+        slNo: { type: string, description: "'1'..'14' for QUANTITATIVE, 'a'..'g' for QUALITATIVE" }
+        name: { type: string }
+        category: { type: string, enum: [QUANTITATIVE, QUALITATIVE] }
+        maxScore: { type: number, description: "Negative for QUALITATIVE (a fixed penalty)" }
+        displayOrder: { type: integer }
+        options:
+          type: array
+          description: Only populated for QUANTITATIVE parameters
+          items: { $ref: '#/components/schemas/CreditScoreParameterOption' }
+
+    PersonResponse:
+      type: object
+      required: [parameterId]
+      description: >
+        One answered parameter. Exactly one of selectedOptionId (QUANTITATIVE) or
+        qualitativeFlag (QUALITATIVE) must be present. A person's `responses[]`
+        may be a partial subset of their profile's parameters (draft state) —
+        QUANTITATIVE parameters left out simply score 0 until answered.
+      properties:
+        parameterId: { type: integer }
+        selectedOptionId: { type: integer, nullable: true }
+        qualitativeFlag: { type: boolean, nullable: true }
+        netScore: { type: number, readOnly: true, description: "Server-computed: maxScore x option.weightage, or maxScore x flag" }
+
     Person:
       type: object
-      required: [name, employmentType]
+      required: [name, profileType]
       description: >
-        creditScore, worstDpdDays and enquiryCount6Months are bureau-fetched fields
-        (CIBIL/credit-bureau report pull) — meant to be populated by an upstream
-        bureau integration, not typed in manually. See DOCUMENTATION.md Section 5.6.
+        One subscriber/guarantor. `profileType` selects which of the two
+        independent Credit Score sheets (Employee/Salaried or Business) this
+        person's `responses[]` are validated and scored against — see
+        DOCUMENTATION.md Section 19, Excel-to-Application Mapping.
       properties:
+        id: { type: integer, readOnly: true }
+        role: { type: string, readOnly: true, description: "'SB' or 'SURETY-1', 'SURETY-2', ..." }
         name: { type: string }
-        employmentType: { type: string, enum: [Salaried-Govt, Salaried-PSU, Salaried-Private, Business, "Self Employed - Professional", Agriculture, Other] }
-        entityType: { type: string, enum: [PvtLtd, Partnership, Proprietorship], nullable: true }
-        creditScore: { type: integer, minimum: 300, maximum: 900, nullable: true, description: "Bureau-fetched" }
-        worstDpdDays: { type: integer, minimum: 0, nullable: true, description: "Bureau-fetched; null/0 = clean" }
-        enquiryCount6Months: { type: integer, minimum: 0, nullable: true, description: "Bureau-fetched" }
-        grossIncome: { type: number }
-        netIncome: { type: number }
+        profileType: { type: string, enum: [SALARIED, BUSINESS] }
+        totalScore: { type: number, readOnly: true, nullable: true, description: "Sum of QUANTITATIVE net scores (Excel 'Total Score', max 100)" }
+        totalFinalScore: { type: number, readOnly: true, nullable: true, description: "totalScore + sum of QUALITATIVE penalties (Excel 'Total Final Score')" }
+        responses: { type: array, items: { $ref: '#/components/schemas/PersonResponse' } }
 
     Security:
       type: object
@@ -559,17 +594,14 @@ components:
 
     CreateScoreCardRequest:
       type: object
-      required: [applicationId, chitValue, futureLiability, grossMonthlyIncome, proposedEmi, subscriber, securities]
+      required: [applicationId, chitValue, futureLiability, subscriber, securities]
       properties:
         applicationId: { type: string, pattern: '^MCF-\d{4}-\d{6}$' }
-        chitValue: { type: number, minimum: 0.01, description: "Also treated as the proposed loan amount for Security Coverage" }
+        chitValue: { type: number, minimum: 0.01, description: "Proposed loan / prize amount" }
         futureLiability: { type: number, minimum: 0.01 }
         documentsComplete: { type: boolean, default: false }
-        grossMonthlyIncome: { type: number, minimum: 0, description: "Income-EMI Coverage input" }
-        existingObligations: { type: number, minimum: 0, default: 0 }
-        proposedEmi: { type: number, minimum: 0 }
         subscriber: { $ref: '#/components/schemas/Person' }
-        guarantors: { type: array, items: { $ref: '#/components/schemas/Person' }, maxItems: 4, description: "Only the first guarantor feeds Guarantor Quality — see DOCUMENTATION.md Section 6 Assumptions" }
+        guarantors: { type: array, items: { $ref: '#/components/schemas/Person' }, maxItems: 4 }
         securities: { type: array, items: { $ref: '#/components/schemas/Security' }, minItems: 1 }
 
     UpdateScoreCardRequest:
@@ -578,39 +610,18 @@ components:
         chitValue: { type: number }
         futureLiability: { type: number }
         documentsComplete: { type: boolean }
-        grossMonthlyIncome: { type: number }
-        existingObligations: { type: number }
-        proposedEmi: { type: number }
         subscriber: { $ref: '#/components/schemas/Person' }
         guarantors: { type: array, items: { $ref: '#/components/schemas/Person' } }
         securities: { type: array, items: { $ref: '#/components/schemas/Security' } }
         remarks: { type: string, maxLength: 2000 }
 
-    ScoreFactor:
-      type: object
-      properties:
-        score: { type: number }
-        max: { type: number }
-
-    ScoreCardScores:
-      type: object
-      description: >
-        The 6-factor Score Card model — see DOCUMENTATION.md Section 6 for each
-        factor's exact band definition. These bands are engineering defaults
-        pending Client confirmation.
-      properties:
-        cibilFactorScore: { type: number, nullable: true, description: "max 20" }
-        incomeEmiScore: { type: number, nullable: true, description: "max 20" }
-        securityCoverageScore: { type: number, nullable: true, description: "max 15" }
-        dpdHistoryScore: { type: number, nullable: true, description: "max 20" }
-        enquiryCountScore: { type: number, nullable: true, description: "max 15" }
-        guarantorQualityScore: { type: number, nullable: true, description: "max 10" }
-        totalScore: { type: number, nullable: true, description: "sum of the 6 factors, max 100" }
-        eligible: { type: boolean, nullable: true, description: "totalScore >= 75" }
-        decisionText: { type: string, nullable: true, enum: ["Eligible for Approval", "Conditional - Manual Review Required", "Not Eligible"] }
-
     ScoreCard:
       type: object
+      description: >
+        Per-person scoring: each of subscriber/guarantors carries its own
+        totalScore/totalFinalScore (see Person schema) — there is no case-level
+        blended score or eligibility field, since Credit Score.xlsx defines
+        neither (see DOCUMENTATION.md Section 20, Open Questions).
       properties:
         id: { type: string, format: uuid }
         applicationId: { type: string }
@@ -621,11 +632,7 @@ components:
         securityTotalValue: { type: number }
         documentsComplete: { type: boolean }
         securityCoversLiability: { type: boolean }
-        cibilComplete: { type: boolean }
-        grossMonthlyIncome: { type: number }
-        existingObligations: { type: number }
-        proposedEmi: { type: number }
-        scores: { $ref: '#/components/schemas/ScoreCardScores' }
+        cibilComplete: { type: boolean, description: "True once the subscriber and every guarantor has answered their profile's CIBIL Score parameter" }
         subscriber: { $ref: '#/components/schemas/Person' }
         guarantors: { type: array, items: { $ref: '#/components/schemas/Person' } }
         securities: { type: array, items: { $ref: '#/components/schemas/Security' } }
@@ -645,23 +652,23 @@ components:
               message: { type: string }
         scoreCard: { $ref: '#/components/schemas/ScoreCard' }
 
+    PersonSummary:
+      type: object
+      properties:
+        id: { type: integer }
+        role: { type: string }
+        name: { type: string }
+        profileType: { type: string, enum: [SALARIED, BUSINESS] }
+        totalScore: { type: number, nullable: true }
+        totalFinalScore: { type: number, nullable: true }
+
     ScoreSummary:
       type: object
       properties:
         applicationId: { type: string }
         status: { $ref: '#/components/schemas/Status' }
-        factors:
-          type: object
-          properties:
-            cibilFactorScore: { type: number, nullable: true }
-            incomeEmiScore: { type: number, nullable: true }
-            securityCoverageScore: { type: number, nullable: true }
-            dpdHistoryScore: { type: number, nullable: true }
-            enquiryCountScore: { type: number, nullable: true }
-            guarantorQualityScore: { type: number, nullable: true }
-        totalScore: { type: number, nullable: true }
-        eligible: { type: boolean, nullable: true }
-        decisionText: { type: string, nullable: true }
+        subscriber: { $ref: '#/components/schemas/PersonSummary' }
+        guarantors: { type: array, items: { $ref: '#/components/schemas/PersonSummary' } }
         readyToSubmit: { type: boolean }
         guardStatus:
           type: object

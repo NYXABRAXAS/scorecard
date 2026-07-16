@@ -58,19 +58,52 @@ CREATE TABLE security_type_master (
   updated_at      TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 
--- Decision thresholds for the total_score (out of 100) computed by the 6-factor
--- Score Card engine. NOTE: these thresholds (75 / 60) are an engineering DEFAULT
--- pending Client confirmation — see DOCUMENTATION.md Section 6 "Assumptions".
-CREATE TABLE scorecard_decision_band_master (
-  id              SMALLSERIAL  PRIMARY KEY,
-  min_score       NUMERIC(6,2) NOT NULL,
-  max_score       NUMERIC(6,2) NOT NULL,
-  band_code       VARCHAR(20)  NOT NULL,               -- ELIGIBLE / CONDITIONAL / NOT_ELIGIBLE
-  label           VARCHAR(60)  NOT NULL,
-  decision_text   VARCHAR(60)  NOT NULL,
-  display_order   SMALLINT     NOT NULL,
-  CONSTRAINT chk_band_range CHECK (max_score >= min_score)
+-- ----------------------------------------------------------------------------
+-- Credit Score parameter matrix — the single source of truth is "Credit Score.xlsx"
+-- (two sheets: "Employee" = SALARIED profile, "Business" = BUSINESS profile).
+-- Every parameter, option, weightage and max-score value below is loaded verbatim
+-- from that workbook by db/seed_credit_score.sql (generated, not hand-typed) — see
+-- DOCUMENTATION.md Section 19 "Excel-to-Application Mapping" for the full trace.
+--
+-- Design: QUANTITATIVE parameters are answered by picking one option from a fixed
+-- dropdown list (scorecard_parameter_option_master); net score = maxScore x
+-- option.weightage. QUALITATIVE parameters are yes/no flags with a fixed penalty;
+-- net score = maxScore (already negative) x flag(0/1). This mirrors the Excel's
+-- own structure exactly: every quantitative parameter has a merged "selector" cell
+-- validated against a dropdown list of options immediately below it, and the 7
+-- qualitative items are plain yes/no checks with a fixed penalty each.
+--
+-- NOTE: the Excel defines NO eligibility/pass-fail threshold on the Total Final
+-- Score — it only computes the number. No such threshold is invented here either;
+-- see DOCUMENTATION.md Section 20 "Open Questions".
+-- ----------------------------------------------------------------------------
+
+CREATE TABLE scorecard_parameter_master (
+  id              BIGSERIAL    PRIMARY KEY,
+  profile_type    VARCHAR(10)  NOT NULL,
+  CONSTRAINT chk_param_profile CHECK (profile_type IN ('SALARIED','BUSINESS')),
+  sl_no           VARCHAR(10)  NOT NULL,     -- '1'..'14' for quantitative, 'a'..'g' for qualitative
+  name            TEXT         NOT NULL,     -- exact Excel wording, per profile
+  category        VARCHAR(12)  NOT NULL,
+  CONSTRAINT chk_param_category CHECK (category IN ('QUANTITATIVE','QUALITATIVE')),
+  max_score       NUMERIC(6,2) NOT NULL,     -- negative for QUALITATIVE (a fixed penalty)
+  display_order   INT          NOT NULL,
+  is_active       BOOLEAN      NOT NULL DEFAULT TRUE,
+  UNIQUE (profile_type, sl_no)
 );
+
+CREATE INDEX idx_parameter_master_profile ON scorecard_parameter_master (profile_type, display_order);
+
+CREATE TABLE scorecard_parameter_option_master (
+  id              BIGSERIAL    PRIMARY KEY,
+  parameter_id    BIGINT       NOT NULL REFERENCES scorecard_parameter_master(id) ON DELETE CASCADE,
+  option_label    TEXT         NOT NULL,     -- exact Excel wording, incl. its typos/spacing
+  weightage       NUMERIC(5,4) NOT NULL,     -- 0-1 ratio, as given in the Excel's weightage column
+  display_order   INT          NOT NULL,
+  UNIQUE (parameter_id, option_label)
+);
+
+CREATE INDEX idx_parameter_option_param ON scorecard_parameter_option_master (parameter_id, display_order);
 
 -- ----------------------------------------------------------------------------
 -- Core Score Card entity (one CURRENT row per application_id)
@@ -85,30 +118,13 @@ CREATE TABLE score_cards (
   CONSTRAINT chk_status CHECK (status IN
     ('DRAFT','VALIDATED','SUBMITTED','UNDER_REVIEW','APPROVED','REJECTED')),
 
-  -- --- Inputs driving the 6-factor score & submit guards ---
-  chit_value               NUMERIC(14,2) NOT NULL,       -- also treated as the proposed loan amount for Security Coverage
+  -- --- Inputs driving submit guards (independent of the Credit Score matrix) ---
+  chit_value               NUMERIC(14,2) NOT NULL,       -- proposed loan / prize amount
   future_liability         NUMERIC(14,2) NOT NULL,
   security_total_value     NUMERIC(14,2) NOT NULL DEFAULT 0,
   documents_complete       BOOLEAN       NOT NULL DEFAULT FALSE,
   security_covers_liability BOOLEAN      NOT NULL DEFAULT FALSE,
-  cibil_complete            BOOLEAN      NOT NULL DEFAULT FALSE,
-  gross_monthly_income      NUMERIC(14,2) NOT NULL DEFAULT 0,  -- subscriber's gross monthly income (Income-EMI Coverage input)
-  existing_obligations      NUMERIC(14,2) NOT NULL DEFAULT 0,  -- subscriber's existing monthly EMI/obligations
-  proposed_emi              NUMERIC(14,2) NOT NULL DEFAULT 0,  -- this loan's proposed monthly instalment
-
-  -- --- Computed 6-factor scoring outputs (see src/modules/scorecard/scoring.engine.js) ---
-  -- NOTE: these band boundaries are engineering DEFAULTS pending Client confirmation —
-  -- see DOCUMENTATION.md Section 6 "Assumptions" — unlike the security valuation
-  -- formula (Section 5.7), which IS sourced from the signed-off FRD.
-  cibil_factor_score        NUMERIC(5,2),   -- max 20
-  income_emi_score          NUMERIC(5,2),   -- max 20
-  security_coverage_score   NUMERIC(5,2),   -- max 15
-  dpd_history_score         NUMERIC(5,2),   -- max 20
-  enquiry_count_score       NUMERIC(5,2),   -- max 15
-  guarantor_quality_score   NUMERIC(5,2),   -- max 10
-  total_score               NUMERIC(5,2),   -- sum of the 6 factors, max 100
-  eligible                  BOOLEAN,        -- total_score >= 75 (see decisionFor() for the exact threshold)
-  decision_text             VARCHAR(60),    -- "Eligible for Approval" / "Conditional - Manual Review Required" / "Not Eligible"
+  cibil_complete            BOOLEAN      NOT NULL DEFAULT FALSE,  -- true once every person has answered the "CIBIL Score" parameter
 
   -- --- Workflow / lifecycle actors ---
   created_by                BIGINT       NOT NULL REFERENCES app_user(id),
@@ -160,7 +176,14 @@ CREATE TABLE score_card_versions (
 CREATE INDEX idx_score_card_versions_card ON score_card_versions (score_card_id, version DESC);
 
 -- ----------------------------------------------------------------------------
--- Subscriber + Guarantor person records (Annexure 2, Section 4)
+-- Subscriber + Guarantor person records.
+--
+-- Every scored attribute (age, occupation, income, CIBIL band, cheque-return
+-- history, etc.) lives in score_card_person_responses below, driven by whichever
+-- profile_type applies to this person — NOT as columns here. This mirrors the
+-- Excel exactly: each sheet ("Employee"/"Business") is filled in once per
+-- subscriber-or-guarantor, independently: there is no cross-person blending
+-- formula anywhere in the workbook.
 -- ----------------------------------------------------------------------------
 
 CREATE TABLE score_card_persons (
@@ -169,33 +192,12 @@ CREATE TABLE score_card_persons (
   person_role           VARCHAR(15)  NOT NULL,      -- 'SB' or 'SURETY-1', 'SURETY-2', ...
   CONSTRAINT chk_person_role CHECK (person_role = 'SB' OR person_role ~ '^SURETY-[0-9]+$'),
   name                  VARCHAR(120) NOT NULL,
-  employment_type       VARCHAR(40),                -- Salaried-Govt / Salaried-Private / Business / Self Employed / Agriculture / Other
-  entity_type           VARCHAR(20),                -- PvtLtd / Partnership / Proprietorship (business only)
-  years_in_business      NUMERIC(4,1),
-  years_of_service       NUMERIC(4,1),
-  employee_count         INT,
-  staff_count            INT,
-  permanent_govt         BOOLEAN,
-  customer_vintage_years NUMERIC(4,1),
-  personal_visits        INT          NOT NULL DEFAULT 0,
-  property_count         INT          NOT NULL DEFAULT 0,
-  property_value         NUMERIC(14,2) NOT NULL DEFAULT 0,
-  credit_score            INT,                       -- CIBIL / bureau score
-  -- Bureau-fetched fields (Section 6.2 factors) — these come from the CIBIL/bureau
-  -- report pull, never typed in manually by the Branch Initiator at the score card
-  -- step. worst_dpd_days/enquiry_count_6m are read from the SUBSCRIBER row by the
-  -- scoring engine; a guarantor row may also carry them for completeness/audit.
-  worst_dpd_days          INT,                        -- worst days-past-due across the bureau history; NULL/0 = clean
-  enquiry_count_6m        INT,                         -- hard enquiries in the last 6 months
-  foir                    NUMERIC(5,4),               -- ratio 0-1
-  gross_income            NUMERIC(14,2),
-  net_income              NUMERIC(14,2),
-  direct_exposure         NUMERIC(14,2) NOT NULL DEFAULT 0,
-  indirect_exposure       NUMERIC(14,2) NOT NULL DEFAULT 0,
-  suit_filed              BOOLEAN      NOT NULL DEFAULT FALSE,
-  prl_flag                BOOLEAN      NOT NULL DEFAULT FALSE,
-  cc3_flag                BOOLEAN      NOT NULL DEFAULT FALSE,
-  cheque_bounce_count     INT          NOT NULL DEFAULT 0,
+  profile_type          VARCHAR(10)  NOT NULL,       -- which Excel sheet applies to this person
+  CONSTRAINT chk_person_profile CHECK (profile_type IN ('SALARIED','BUSINESS')),
+
+  -- Computed by src/modules/scorecard/creditScoreEngine.js — never hand-set.
+  total_score           NUMERIC(6,2),    -- sum of QUANTITATIVE net scores (Excel "Total Score", max 100)
+  total_final_score     NUMERIC(7,2),    -- total_score + sum of QUALITATIVE penalties (Excel "Total Final Score")
 
   created_at               TIMESTAMPTZ  NOT NULL DEFAULT now(),
   updated_at               TIMESTAMPTZ  NOT NULL DEFAULT now(),
@@ -203,6 +205,25 @@ CREATE TABLE score_card_persons (
 );
 
 CREATE INDEX idx_score_card_persons_card ON score_card_persons (score_card_id);
+
+-- ----------------------------------------------------------------------------
+-- One row per (person, parameter) answer — the actual filled-in Credit Score sheet.
+-- ----------------------------------------------------------------------------
+
+CREATE TABLE score_card_person_responses (
+  id                      BIGSERIAL    PRIMARY KEY,
+  score_card_person_id    BIGINT       NOT NULL REFERENCES score_card_persons(id) ON DELETE CASCADE,
+  parameter_id            BIGINT       NOT NULL REFERENCES scorecard_parameter_master(id),
+  selected_option_id      BIGINT       REFERENCES scorecard_parameter_option_master(id), -- QUANTITATIVE
+  qualitative_flag        BOOLEAN,                                                        -- QUALITATIVE
+  net_score               NUMERIC(7,2) NOT NULL,   -- server-computed: maxScore x weightage, or maxScore x flag
+  created_at              TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  updated_at              TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  -- One answer per parameter per person — the "no duplicate mappings" rule enforced at the DB level.
+  UNIQUE (score_card_person_id, parameter_id)
+);
+
+CREATE INDEX idx_person_responses_person ON score_card_person_responses (score_card_person_id);
 
 -- ----------------------------------------------------------------------------
 -- Securities offered (drives security_total_value + is_secured segmentation)
@@ -289,4 +310,8 @@ CREATE TRIGGER trg_score_cards_updated_at
 
 CREATE TRIGGER trg_score_card_persons_updated_at
   BEFORE UPDATE ON score_card_persons
+  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TRIGGER trg_person_responses_updated_at
+  BEFORE UPDATE ON score_card_person_responses
   FOR EACH ROW EXECUTE FUNCTION set_updated_at();

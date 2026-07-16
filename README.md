@@ -1,10 +1,10 @@
 # MCF LOS — Score Card API
 
 REST API for the Score Card module of the MCF Prize-Money-Against-Security Loan
-Origination System — subscriber/guarantor credit risk scoring via a 6-factor model
-(CIBIL Score, Income-EMI Coverage, Security Coverage, DPD History, Enquiry Count,
-Guarantor Quality), with a full Draft → Validate → Submit → Approve/Reject
-lifecycle, audit trail, and version history.
+Origination System — subscriber/guarantor credit risk scoring per **Credit Score.xlsx**'s
+two independent score cards (Employee/Salaried and Business), a dropdown/lookup
+parameter matrix scored per-person, with a full Draft → Validate → Submit →
+Approve/Reject lifecycle, audit trail, and version history.
 
 **Full technical documentation: [DOCUMENTATION.md](DOCUMENTATION.md)**
 **API reference: [openapi.yaml](openapi.yaml)** (also served at `GET /docs` once running)
@@ -42,8 +42,8 @@ curl -X POST http://localhost:4000/api/v1/auth/login \
 npm test
 ```
 
-119 tests (45 calculation-engine + 19 security-valuation + 20 validation-schema +
-35 API integration tests), all runnable against a real PostgreSQL instance — see
+98 tests (calculation-engine + security-valuation + validation-schema + API
+integration), all passing against a real PostgreSQL instance — see
 [DOCUMENTATION.md §14](DOCUMENTATION.md#14-test-cases).
 
 ## Deploying to Render
@@ -60,6 +60,7 @@ a web service wired together automatically (`DB_*` env vars, `JWT_SECRET`).
    ```bash
    PGPASSWORD=<password> psql -h <host> -p <port> -U <user> -d <database> -f db/schema.sql
    PGPASSWORD=<password> psql -h <host> -p <port> -U <user> -d <database> -f db/seed.sql
+   PGPASSWORD=<password> psql -h <host> -p <port> -U <user> -d <database> -f db/seed_credit_score.sql
    ```
    (Render's free-tier web services don't expose a shell, so this has to run from
    a machine that can reach the External connection string — psql, not the app.)

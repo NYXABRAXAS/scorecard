@@ -16,7 +16,7 @@ function actorFrom(req) {
   };
 }
 
-const SORTABLE_FIELDS = ['created_at', 'updated_at', 'total_score', 'status', 'application_id'];
+const SORTABLE_FIELDS = ['created_at', 'updated_at', 'status', 'application_id'];
 
 module.exports = {
   // POST /score-cards

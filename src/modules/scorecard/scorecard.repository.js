@@ -17,20 +17,6 @@ function mapScoreCardRow(row) {
     documentsComplete: row.documents_complete,
     securityCoversLiability: row.security_covers_liability,
     cibilComplete: row.cibil_complete,
-    grossMonthlyIncome: Number(row.gross_monthly_income),
-    existingObligations: Number(row.existing_obligations),
-    proposedEmi: Number(row.proposed_emi),
-    scores: {
-      cibilFactorScore: row.cibil_factor_score != null ? Number(row.cibil_factor_score) : null,
-      incomeEmiScore: row.income_emi_score != null ? Number(row.income_emi_score) : null,
-      securityCoverageScore: row.security_coverage_score != null ? Number(row.security_coverage_score) : null,
-      dpdHistoryScore: row.dpd_history_score != null ? Number(row.dpd_history_score) : null,
-      enquiryCountScore: row.enquiry_count_score != null ? Number(row.enquiry_count_score) : null,
-      guarantorQualityScore: row.guarantor_quality_score != null ? Number(row.guarantor_quality_score) : null,
-      totalScore: row.total_score != null ? Number(row.total_score) : null,
-      eligible: row.eligible,
-      decisionText: row.decision_text
-    },
     audit: {
       createdBy: row.created_by,
       createdAt: row.created_at,
@@ -58,13 +44,18 @@ function mapPersonRow(row) {
     id: row.id,
     role: row.person_role,
     name: row.name,
-    employmentType: row.employment_type,
-    entityType: row.entity_type,
-    creditScore: row.credit_score,
-    worstDpdDays: row.worst_dpd_days,
-    enquiryCount6Months: row.enquiry_count_6m,
-    grossIncome: row.gross_income != null ? Number(row.gross_income) : null,
-    netIncome: row.net_income != null ? Number(row.net_income) : null
+    profileType: row.profile_type,
+    totalScore: row.total_score != null ? Number(row.total_score) : null,
+    totalFinalScore: row.total_final_score != null ? Number(row.total_final_score) : null
+  };
+}
+
+function mapResponseRow(row) {
+  return {
+    parameterId: row.parameter_id,
+    selectedOptionId: row.selected_option_id,
+    qualitativeFlag: row.qualitative_flag,
+    netScore: Number(row.net_score)
   };
 }
 
@@ -80,9 +71,30 @@ function mapSecurityRow(row) {
   };
 }
 
+/** Persists one person's already-computed responses (netScore per response, totals on the person row). */
+async function insertPerson(client, scoreCardId, role, person) {
+  const personResult = await client.query(
+    `INSERT INTO score_card_persons (score_card_id, person_role, name, profile_type, total_score, total_final_score)
+     VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+    [scoreCardId, role, person.name, person.profileType, person.totalScore ?? null, person.totalFinalScore ?? null]
+  );
+  const personId = personResult.rows[0].id;
+
+  for (const r of person.responses || []) {
+    await client.query(
+      `INSERT INTO score_card_person_responses
+         (score_card_person_id, parameter_id, selected_option_id, qualitative_flag, net_score)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [personId, r.parameterId, r.selectedOptionId ?? null, r.qualitativeFlag ?? null, r.netScore]
+    );
+  }
+  return personId;
+}
+
 const repository = {
   mapScoreCardRow,
   mapPersonRow,
+  mapResponseRow,
   mapSecurityRow,
 
   async findById(id, { includeDeleted = false } = {}) {
@@ -99,12 +111,28 @@ const repository = {
     return mapScoreCardRow(rows[0]);
   },
 
+  /** Every person for this card, each with its nested `responses[]` (person-parameter answers). */
   async getPersons(scoreCardId) {
     const { rows } = await query(
       `SELECT * FROM score_card_persons WHERE score_card_id = $1 ORDER BY (person_role = 'SB') DESC, person_role ASC`,
       [scoreCardId]
     );
-    return rows.map(mapPersonRow);
+    const persons = rows.map(mapPersonRow);
+    if (!persons.length) return persons;
+
+    const { rows: responseRows } = await query(
+      `SELECT r.* FROM score_card_person_responses r
+       JOIN score_card_persons p ON p.id = r.score_card_person_id
+       WHERE p.score_card_id = $1`,
+      [scoreCardId]
+    );
+    const responsesByPerson = new Map();
+    for (const r of responseRows) {
+      const list = responsesByPerson.get(r.score_card_person_id) || [];
+      list.push(mapResponseRow(r));
+      responsesByPerson.set(r.score_card_person_id, list);
+    }
+    return persons.map((p) => ({ ...p, responses: responsesByPerson.get(p.id) || [] }));
   },
 
   async getSecurities(scoreCardId) {
@@ -112,13 +140,12 @@ const repository = {
     return rows.map(mapSecurityRow);
   },
 
-  async list({ page, pageSize, offset, sortField, sortDir, status, eligible, applicationId, createdBy, fromDate, toDate }) {
+  async list({ page, pageSize, offset, sortField, sortDir, status, applicationId, createdBy, fromDate, toDate }) {
     const where = ['is_deleted = FALSE'];
     const params = [];
     let i = 1;
 
     if (status) { where.push(`status = $${i++}`); params.push(status); }
-    if (eligible !== undefined) { where.push(`eligible = $${i++}`); params.push(eligible); }
     if (applicationId) { where.push(`application_id = $${i++}`); params.push(applicationId); }
     if (createdBy) { where.push(`created_by = $${i++}`); params.push(createdBy); }
     if (fromDate) { where.push(`created_at >= $${i++}`); params.push(fromDate); }
@@ -139,41 +166,25 @@ const repository = {
     };
   },
 
-  /** Creates the score card + its person/security children inside one transaction. */
-  async create({ applicationId, chitValue, futureLiability, documentsComplete, grossMonthlyIncome, existingObligations, proposedEmi, subscriber, guarantors, securities, createdBy }) {
+  /**
+   * Creates the score card + its person/security children inside one transaction.
+   * `subscriber`/`guarantors` are expected already-computed (totalScore, totalFinalScore,
+   * responses[] with netScore) — computing them from raw input is scorecard.service.js's job.
+   */
+  async create({ applicationId, chitValue, futureLiability, documentsComplete, securityTotalValue, securityCoversLiability, cibilComplete, subscriber, guarantors, securities, createdBy }) {
     return withTransaction(async (client) => {
       const cardResult = await client.query(
         `INSERT INTO score_cards
-           (application_id, chit_value, future_liability, documents_complete, gross_monthly_income, existing_obligations, proposed_emi, created_by)
+           (application_id, chit_value, future_liability, documents_complete, security_total_value, security_covers_liability, cibil_complete, created_by)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          RETURNING *`,
-        [applicationId, chitValue, futureLiability, documentsComplete, grossMonthlyIncome, existingObligations || 0, proposedEmi, createdBy]
+        [applicationId, chitValue, futureLiability, documentsComplete, securityTotalValue || 0, !!securityCoversLiability, !!cibilComplete, createdBy]
       );
       const card = cardResult.rows[0];
 
-      await client.query(
-        `INSERT INTO score_card_persons
-           (score_card_id, person_role, name, employment_type, entity_type, credit_score, worst_dpd_days, enquiry_count_6m, gross_income, net_income)
-         VALUES ($1,'SB',$2,$3,$4,$5,$6,$7,$8,$9)`,
-        [
-          card.id, subscriber.name, subscriber.employmentType, subscriber.entityType || null,
-          subscriber.creditScore ?? null, subscriber.worstDpdDays ?? null, subscriber.enquiryCount6Months ?? null,
-          subscriber.grossIncome || null, subscriber.netIncome || null
-        ]
-      );
-
+      await insertPerson(client, card.id, 'SB', subscriber);
       for (let idx = 0; idx < (guarantors || []).length; idx += 1) {
-        const g = guarantors[idx];
-        await client.query(
-          `INSERT INTO score_card_persons
-             (score_card_id, person_role, name, employment_type, entity_type, credit_score, worst_dpd_days, enquiry_count_6m, gross_income, net_income)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-          [
-            card.id, `SURETY-${idx + 1}`, g.name, g.employmentType, g.entityType || null,
-            g.creditScore ?? null, g.worstDpdDays ?? null, g.enquiryCount6Months ?? null,
-            g.grossIncome || null, g.netIncome || null
-          ]
-        );
+        await insertPerson(client, card.id, `SURETY-${idx + 1}`, guarantors[idx]);
       }
 
       for (const s of securities) {
@@ -188,15 +199,12 @@ const repository = {
     });
   },
 
-  /** Persists a partial update to the score card + replaces person/security children if supplied. */
+  /** Persists a partial update to the score card's own fields (not persons/securities). */
   async update(id, patch, client) {
     const fieldMap = {
       chitValue: 'chit_value',
       futureLiability: 'future_liability',
       documentsComplete: 'documents_complete',
-      grossMonthlyIncome: 'gross_monthly_income',
-      existingObligations: 'existing_obligations',
-      proposedEmi: 'proposed_emi',
       remarks: 'remarks'
     };
     const sets = [];
@@ -214,23 +222,25 @@ const repository = {
     await runner.query(`UPDATE score_cards SET ${sets.join(', ')} WHERE id = $${i}`, params);
   },
 
+  /** Replaces every person (+ their responses), leaving securities untouched — used to write back a fresh recalculation. */
+  async replacePersons(id, { subscriber, guarantors }, client) {
+    const runner = client || { query };
+    await runner.query(`DELETE FROM score_card_persons WHERE score_card_id = $1`, [id]);
+    await insertPerson(runner, id, 'SB', subscriber);
+    for (let idx = 0; idx < (guarantors || []).length; idx += 1) {
+      await insertPerson(runner, id, `SURETY-${idx + 1}`, guarantors[idx]);
+    }
+  },
+
+  /** Replaces every person (+ their responses) and every security for this card with the given (already-computed) set. */
   async replacePersonsAndSecurities(id, { subscriber, guarantors, securities }, client) {
     const runner = client || { query };
     await runner.query(`DELETE FROM score_card_persons WHERE score_card_id = $1`, [id]);
     await runner.query(`DELETE FROM score_card_securities WHERE score_card_id = $1`, [id]);
 
-    const people = [{ ...subscriber, role: 'SB' }, ...(guarantors || []).map((g, i) => ({ ...g, role: `SURETY-${i + 1}` }))];
-    for (const p of people) {
-      await runner.query(
-        `INSERT INTO score_card_persons
-           (score_card_id, person_role, name, employment_type, entity_type, credit_score, worst_dpd_days, enquiry_count_6m, gross_income, net_income)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-        [
-          id, p.role, p.name, p.employmentType, p.entityType || null,
-          p.creditScore ?? null, p.worstDpdDays ?? null, p.enquiryCount6Months ?? null,
-          p.grossIncome || null, p.netIncome || null
-        ]
-      );
+    await insertPerson(runner, id, 'SB', subscriber);
+    for (let idx = 0; idx < (guarantors || []).length; idx += 1) {
+      await insertPerson(runner, id, `SURETY-${idx + 1}`, guarantors[idx]);
     }
     for (const s of securities || []) {
       await runner.query(
@@ -241,23 +251,14 @@ const repository = {
     }
   },
 
-  /** Persists freshly-computed scoring output onto the score card row. */
+  /** Persists freshly-computed case-level guard values onto the score card row (per-person scores live on score_card_persons). */
   async applyComputedScores(id, computed, client) {
     const runner = client || { query };
     await runner.query(
       `UPDATE score_cards SET
-         security_total_value = $1, security_covers_liability = $2, cibil_complete = $3,
-         cibil_factor_score = $4, income_emi_score = $5, security_coverage_score = $6,
-         dpd_history_score = $7, enquiry_count_score = $8, guarantor_quality_score = $9,
-         total_score = $10, eligible = $11, decision_text = $12
-       WHERE id = $13`,
-      [
-        computed.securityTotalValue, computed.securityCoversLiability, computed.cibilComplete,
-        computed.factors.cibilScore.score, computed.factors.incomeEmiCoverage.score, computed.factors.securityCoverage.score,
-        computed.factors.dpdHistory.score, computed.factors.enquiryCount.score, computed.factors.guarantorQuality.score,
-        computed.totalScore, computed.eligible, computed.decisionText,
-        id
-      ]
+         security_total_value = $1, security_covers_liability = $2, cibil_complete = $3
+       WHERE id = $4`,
+      [computed.securityTotalValue, computed.securityCoversLiability, computed.cibilComplete, id]
     );
   },
 

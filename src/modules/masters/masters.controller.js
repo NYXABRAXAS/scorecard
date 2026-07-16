@@ -3,12 +3,8 @@
 const { query } = require('../../config/db');
 const { ok } = require('../../utils/apiResponse');
 const { asyncHandler } = require('../../middleware/errorHandler');
+const ApiError = require('../../utils/ApiError');
 
-const EMPLOYMENT_TYPES = [
-  'Salaried-Govt', 'Salaried-PSU', 'Salaried-Private',
-  'Business', 'Self Employed - Professional', 'Agriculture', 'Other'
-];
-const ENTITY_TYPES = ['PvtLtd', 'Partnership', 'Proprietorship'];
 const DOCUMENT_TYPES = ['DPN', 'KYC', 'Gold Appraisal', 'Income Proof', 'Address Proof', 'Bank Statement', 'Other'];
 
 module.exports = {
@@ -24,23 +20,46 @@ module.exports = {
     })));
   }),
 
-  // GET /masters/score-bands
-  scoreBands: asyncHandler(async (req, res) => {
-    const { rows } = await query(`SELECT * FROM scorecard_decision_band_master ORDER BY display_order`);
-    ok(res, rows.map((r) => ({
-      minScore: Number(r.min_score), maxScore: Number(r.max_score),
-      bandCode: r.band_code, label: r.label, decisionText: r.decision_text
+  /**
+   * GET /masters/credit-score-parameters?profileType=SALARIED|BUSINESS
+   * Returns the full parameter + option matrix for one profile, exactly as
+   * loaded from Credit Score.xlsx (db/seed_credit_score.sql) — this is what
+   * the UI renders as the score card form for that profile.
+   */
+  creditScoreParameters: asyncHandler(async (req, res) => {
+    const profileType = String(req.query.profileType || '').toUpperCase();
+    if (!['SALARIED', 'BUSINESS'].includes(profileType)) {
+      throw ApiError.badRequest('INVALID_PROFILE_TYPE', 'profileType query parameter must be SALARIED or BUSINESS.');
+    }
+
+    const { rows: paramRows } = await query(
+      `SELECT * FROM scorecard_parameter_master WHERE profile_type = $1 AND is_active = TRUE ORDER BY display_order`,
+      [profileType]
+    );
+    const { rows: optionRows } = await query(
+      `SELECT o.* FROM scorecard_parameter_option_master o
+       JOIN scorecard_parameter_master p ON p.id = o.parameter_id
+       WHERE p.profile_type = $1 ORDER BY o.parameter_id, o.display_order`,
+      [profileType]
+    );
+
+    const optionsByParam = new Map();
+    for (const o of optionRows) {
+      const list = optionsByParam.get(o.parameter_id) || [];
+      list.push({ id: o.id, label: o.option_label, weightage: Number(o.weightage), displayOrder: o.display_order });
+      optionsByParam.set(o.parameter_id, list);
+    }
+
+    ok(res, paramRows.map((p) => ({
+      id: p.id,
+      profileType: p.profile_type,
+      slNo: p.sl_no,
+      name: p.name,
+      category: p.category,
+      maxScore: Number(p.max_score),
+      displayOrder: p.display_order,
+      options: p.category === 'QUANTITATIVE' ? (optionsByParam.get(p.id) || []) : undefined
     })));
-  }),
-
-  // GET /masters/employment-types
-  employmentTypes: asyncHandler(async (req, res) => {
-    ok(res, EMPLOYMENT_TYPES);
-  }),
-
-  // GET /masters/entity-types
-  entityTypes: asyncHandler(async (req, res) => {
-    ok(res, ENTITY_TYPES);
   }),
 
   // GET /masters/document-types

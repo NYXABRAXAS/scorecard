@@ -1,7 +1,8 @@
 'use strict';
 
 const repository = require('./scorecard.repository');
-const { computeScoreCard } = require('./scoring.engine');
+const { loadParameterDefs } = require('./parameterDefs.repository');
+const { computeCreditScore, hasCibilResponse } = require('./creditScoreEngine');
 const { prepareSecurity } = require('./securityValuation');
 const ApiError = require('../../utils/ApiError');
 const { withTransaction } = require('../../config/db');
@@ -34,27 +35,92 @@ function assertCanEdit(card) {
   }
 }
 
-async function buildComputedForCard(scoreCardId) {
-  const [persons, securities] = await Promise.all([
-    repository.getPersons(scoreCardId),
-    repository.getSecurities(scoreCardId)
-  ]);
-  const card = await repository.findById(scoreCardId);
-  const subscriber = persons.find((p) => p.role === 'SB');
-  const guarantors = persons.filter((p) => p.role !== 'SB');
+/** parameterDefs are the same for every person sharing a profileType within one request — load once, reuse. */
+async function loadParameterDefsCached(cache, profileType) {
+  if (!cache.has(profileType)) {
+    cache.set(profileType, await loadParameterDefs(profileType));
+  }
+  return cache.get(profileType);
+}
 
-  const computed = computeScoreCard({
-    subscriber,
-    guarantors,
-    securities,
-    chitValue: card.chitValue,
-    futureLiability: card.futureLiability,
-    documentsComplete: card.documentsComplete,
-    grossMonthlyIncome: card.grossMonthlyIncome,
-    existingObligations: card.existingObligations,
-    proposedEmi: card.proposedEmi
-  });
-  return { card, persons, securities, computed };
+/**
+ * Scores one person's raw responses ({parameterId, selectedOptionId|qualitativeFlag})
+ * against their profile's parameter definitions, and returns the persistable shape:
+ * name/profileType + totalScore/totalFinalScore + the answered responses with netScore.
+ * QUALITATIVE parameters are always persisted (they default to un-flagged/0 unless
+ * answered); unanswered QUANTITATIVE parameters are left out entirely — that's what
+ * makes a partially-filled Credit Score sheet representable as a draft.
+ */
+async function computePerson(cache, person) {
+  const defs = await loadParameterDefsCached(cache, person.profileType);
+  const { totalScore, totalFinalScore, results } = computeCreditScore(defs, person.responses || []);
+  return {
+    name: person.name,
+    profileType: person.profileType,
+    totalScore,
+    totalFinalScore,
+    responses: results
+      .filter((r) => r.category === 'QUALITATIVE' || r.answered)
+      .map((r) => ({
+        parameterId: r.parameterId,
+        selectedOptionId: r.selectedOptionId ?? null,
+        qualitativeFlag: r.qualitativeFlag ?? null,
+        netScore: r.netScore
+      }))
+  };
+}
+
+/** Re-scores a person from their already-persisted responses (used by validate/recalculate). */
+async function recomputeFromStoredResponses(cache, person) {
+  const rawResponses = (person.responses || []).map((r) => ({
+    parameterId: r.parameterId,
+    selectedOptionId: r.selectedOptionId,
+    qualitativeFlag: r.qualitativeFlag
+  }));
+  return computePerson(cache, { name: person.name, profileType: person.profileType, responses: rawResponses });
+}
+
+/** True once the subscriber and every guarantor has answered their profile's CIBIL Score parameter. */
+async function isCibilComplete(cache, subscriber, guarantors) {
+  const subscriberDefs = await loadParameterDefsCached(cache, subscriber.profileType);
+  if (!hasCibilResponse(subscriberDefs, subscriber.responses || [])) return false;
+  for (const g of guarantors || []) {
+    const gDefs = await loadParameterDefsCached(cache, g.profileType);
+    if (!hasCibilResponse(gDefs, g.responses || [])) return false;
+  }
+  return true;
+}
+
+/**
+ * Security/liability guards — independent of the Credit Score matrix (the Excel
+ * defines no formula for these; they mirror the pre-existing FRD Section 6.2 rule).
+ */
+function computeSecurityGuards(securities, futureLiability, documentsComplete) {
+  const securityTotalValue = (securities || []).reduce((sum, s) => sum + (s.valueLoaded || 0), 0);
+  return {
+    securityTotalValue,
+    securityCoversLiability: securityTotalValue >= (futureLiability || 0),
+    documentsComplete: !!documentsComplete
+  };
+}
+
+/** Re-derives every computed value for a card from its currently-persisted state (validate/recalculate). */
+async function buildComputedForCard(scoreCardId) {
+  const [persons, securities, card] = await Promise.all([
+    repository.getPersons(scoreCardId),
+    repository.getSecurities(scoreCardId),
+    repository.findById(scoreCardId)
+  ]);
+  const cache = new Map();
+  const recomputed = [];
+  for (const p of persons) {
+    recomputed.push({ ...(await recomputeFromStoredResponses(cache, p)), role: p.role });
+  }
+  const subscriber = recomputed.find((p) => p.role === 'SB');
+  const guarantors = recomputed.filter((p) => p.role !== 'SB');
+  const cibilComplete = await isCibilComplete(cache, subscriber, guarantors);
+  const guards = computeSecurityGuards(securities, card.futureLiability, card.documentsComplete);
+  return { card, subscriber, guarantors, securities, cibilComplete, ...guards };
 }
 
 async function auditableStatusChange({ scoreCardId, applicationId, newStatus, actorFields, actor, action, detail, oldValue, newValue, changeReason }) {
@@ -85,13 +151,26 @@ const service = {
       });
     }
 
-    const id = await repository.create({ ...input, securities: prepareSecurities(input.securities), createdBy: actor.id });
+    const cache = new Map();
+    const subscriber = await computePerson(cache, input.subscriber);
+    const guarantors = await Promise.all((input.guarantors || []).map((g) => computePerson(cache, g)));
+    const securities = prepareSecurities(input.securities);
+    const cibilComplete = await isCibilComplete(cache, subscriber, guarantors);
+    const guards = computeSecurityGuards(securities, input.futureLiability, input.documentsComplete);
 
-    // Compute the initial segment/score/guard preview immediately, so the create
-    // response already reflects real numbers instead of all-null/default-zero
-    // placeholders that only a subsequent /validate or /recalculate would fill in.
-    const { computed } = await buildComputedForCard(id);
-    await repository.applyComputedScores(id, computed);
+    const id = await repository.create({
+      applicationId: input.applicationId,
+      chitValue: input.chitValue,
+      futureLiability: input.futureLiability,
+      documentsComplete: guards.documentsComplete,
+      securityTotalValue: guards.securityTotalValue,
+      securityCoversLiability: guards.securityCoversLiability,
+      cibilComplete,
+      subscriber,
+      guarantors,
+      securities,
+      createdBy: actor.id
+    });
 
     await repository.insertVersionSnapshot({
       scoreCardId: id, version: 1, status: 'DRAFT',
@@ -122,7 +201,7 @@ const service = {
     return { rows, totalRecords };
   },
 
-  /** PUT — full business update; recomputes scores but does not change status (except VALIDATED -> DRAFT). */
+  /** PUT — full business update; recomputes scores but does not change status (except VALIDATED/REJECTED -> DRAFT). */
   async update(id, patch, actor) {
     const card = await repository.findById(id);
     if (!card) throw ApiError.notFound(`Score card ${id} not found.`);
@@ -132,20 +211,27 @@ const service = {
 
     await withTransaction(async (client) => {
       await repository.update(id, patch, client);
-      if (patch.subscriber || patch.guarantors || patch.securities) {
-        // oldValue.securities are already in prepared/computed shape (from getById);
-        // only patch.securities is raw client input that still needs valuation.
-        const merged = {
-          subscriber: patch.subscriber || oldValue.subscriber,
-          guarantors: patch.guarantors || oldValue.guarantors,
-          securities: patch.securities ? prepareSecurities(patch.securities) : oldValue.securities
-        };
-        await repository.replacePersonsAndSecurities(id, merged, client);
-      }
-      const { computed } = await buildComputedForCard(id);
-      await repository.applyComputedScores(id, computed, client);
 
-      // Any edit to an already-VALIDATED card invalidates it — must be re-validated before submit.
+      const cache = new Map();
+      const subscriber = patch.subscriber ? await computePerson(cache, patch.subscriber) : oldValue.subscriber;
+      const guarantors = patch.guarantors
+        ? await Promise.all(patch.guarantors.map((g) => computePerson(cache, g)))
+        : oldValue.guarantors;
+      const securities = patch.securities ? prepareSecurities(patch.securities) : oldValue.securities;
+
+      if (patch.subscriber || patch.guarantors || patch.securities) {
+        await repository.replacePersonsAndSecurities(id, { subscriber, guarantors, securities }, client);
+      }
+
+      const cibilComplete = await isCibilComplete(cache, subscriber, guarantors);
+      const guards = computeSecurityGuards(
+        securities,
+        patch.futureLiability !== undefined ? patch.futureLiability : card.futureLiability,
+        patch.documentsComplete !== undefined ? patch.documentsComplete : card.documentsComplete
+      );
+      await repository.applyComputedScores(id, { ...guards, cibilComplete }, client);
+
+      // Any edit to an already-VALIDATED/REJECTED card invalidates it — must be re-validated before submit.
       if (card.status === 'VALIDATED' || card.status === 'REJECTED') {
         await repository.setStatus(id, 'DRAFT', { updated_by: actor.id }, client);
       } else {
@@ -173,14 +259,26 @@ const service = {
       throw ApiError.businessRule('INVALID_STATE_FOR_DRAFT_SAVE', `Cannot save draft on a score card in status ${card.status}.`);
     }
     await repository.update(id, patch, null);
+
     if (patch.subscriber || patch.guarantors || patch.securities) {
       const current = await this.getById(id);
-      await repository.replacePersonsAndSecurities(id, {
-        subscriber: patch.subscriber || current.subscriber,
-        guarantors: patch.guarantors || current.guarantors,
-        securities: patch.securities ? prepareSecurities(patch.securities) : current.securities
-      }, null);
+      const cache = new Map();
+      const subscriber = patch.subscriber ? await computePerson(cache, patch.subscriber) : current.subscriber;
+      const guarantors = patch.guarantors
+        ? await Promise.all(patch.guarantors.map((g) => computePerson(cache, g)))
+        : current.guarantors;
+      const securities = patch.securities ? prepareSecurities(patch.securities) : current.securities;
+      await repository.replacePersonsAndSecurities(id, { subscriber, guarantors, securities }, null);
+
+      const cibilComplete = await isCibilComplete(cache, subscriber, guarantors);
+      const guards = computeSecurityGuards(
+        securities,
+        patch.futureLiability !== undefined ? patch.futureLiability : card.futureLiability,
+        patch.documentsComplete !== undefined ? patch.documentsComplete : card.documentsComplete
+      );
+      await repository.applyComputedScores(id, { ...guards, cibilComplete }, null);
     }
+
     await repository.insertAuditLog({
       scoreCardId: id, applicationId: card.applicationId, actorUserId: actor.id, actorRole: actor.role,
       actorLabel: actor.label, action: 'SAVE_DRAFT', detail: 'Draft saved', ipAddress: actor.ip, userAgent: actor.userAgent
@@ -189,7 +287,7 @@ const service = {
   },
 
   /**
-   * Recomputes the score and evaluates the three submit guards
+   * Recomputes every person's score and evaluates the three submit guards
    * (documentsComplete, securityCoversLiability, cibilComplete) — mirrors
    * workflow-engine.js's BRANCH_WIP -> SCRUTINY_PENDING guard array exactly.
    * On success, transitions DRAFT -> VALIDATED. Does NOT throw on guard failure —
@@ -202,13 +300,16 @@ const service = {
       throw ApiError.businessRule('INVALID_STATE_FOR_VALIDATE', `Only a DRAFT score card can be validated (current status: ${card.status}).`);
     }
 
-    const { computed } = await buildComputedForCard(id);
-    await repository.applyComputedScores(id, computed);
+    const { subscriber, guarantors, cibilComplete, securityTotalValue, securityCoversLiability, documentsComplete } = await buildComputedForCard(id);
+    await withTransaction(async (client) => {
+      await repository.replacePersons(id, { subscriber, guarantors }, client);
+      await repository.applyComputedScores(id, { securityTotalValue, securityCoversLiability, cibilComplete }, client);
+    });
 
     const failedGuards = [];
-    if (!computed.documentsComplete) failedGuards.push({ guard: 'documentsComplete', message: 'Mandatory documents (incl. DPN) are still pending upload.' });
-    if (!computed.securityCoversLiability) failedGuards.push({ guard: 'securityCoversLiability', message: 'Accepted security value is below the Future Liability.' });
-    if (!computed.cibilComplete) failedGuards.push({ guard: 'cibilComplete', message: 'CIBIL score is mandatory for the subscriber and every guarantor.' });
+    if (!documentsComplete) failedGuards.push({ guard: 'documentsComplete', message: 'Mandatory documents (incl. DPN) are still pending upload.' });
+    if (!securityCoversLiability) failedGuards.push({ guard: 'securityCoversLiability', message: 'Accepted security value is below the Future Liability.' });
+    if (!cibilComplete) failedGuards.push({ guard: 'cibilComplete', message: 'CIBIL Score is mandatory for the subscriber and every guarantor.' });
 
     if (failedGuards.length === 0) {
       await auditableStatusChange({
@@ -269,7 +370,7 @@ const service = {
     return this.getById(id);
   },
 
-  /** Recomputes scores from current inputs without any status change — e.g. after a late bureau update. */
+  /** Recomputes scores from current inputs without any status change — e.g. after a parameter-master correction. */
   async recalculate(id, actor) {
     const card = await repository.findById(id);
     if (!card) throw ApiError.notFound(`Score card ${id} not found.`);
@@ -277,8 +378,11 @@ const service = {
       throw ApiError.businessRule('INVALID_STATE_FOR_RECALCULATE', `Cannot recalculate a score card that is already ${card.status}.`);
     }
     const before = await this.getById(id);
-    const { computed } = await buildComputedForCard(id);
-    await repository.applyComputedScores(id, computed);
+    const { subscriber, guarantors, cibilComplete, securityTotalValue, securityCoversLiability } = await buildComputedForCard(id);
+    await withTransaction(async (client) => {
+      await repository.replacePersons(id, { subscriber, guarantors }, client);
+      await repository.applyComputedScores(id, { securityTotalValue, securityCoversLiability, cibilComplete }, client);
+    });
 
     const version = await repository.nextVersion(id);
     const snapshot = await repository.findById(id);
@@ -286,7 +390,9 @@ const service = {
     await repository.insertAuditLog({
       scoreCardId: id, applicationId: card.applicationId, actorUserId: actor.id, actorRole: actor.role,
       actorLabel: actor.label, action: 'RECALCULATE', detail: 'Score recalculated',
-      oldValue: before.scores, newValue: computed, ipAddress: actor.ip, userAgent: actor.userAgent
+      oldValue: { subscriber: before.subscriber, guarantors: before.guarantors },
+      newValue: { subscriber, guarantors },
+      ipAddress: actor.ip, userAgent: actor.userAgent
     });
     return this.getById(id);
   },
@@ -306,21 +412,16 @@ const service = {
 
   async getSummary(id) {
     const card = await this.getById(id);
+    const personSummary = (p) => p && {
+      id: p.id, role: p.role, name: p.name, profileType: p.profileType,
+      totalScore: p.totalScore, totalFinalScore: p.totalFinalScore
+    };
     return {
       applicationId: card.applicationId,
       status: card.status,
-      factors: {
-        cibilFactorScore: card.scores.cibilFactorScore,
-        incomeEmiScore: card.scores.incomeEmiScore,
-        securityCoverageScore: card.scores.securityCoverageScore,
-        dpdHistoryScore: card.scores.dpdHistoryScore,
-        enquiryCountScore: card.scores.enquiryCountScore,
-        guarantorQualityScore: card.scores.guarantorQualityScore
-      },
-      totalScore: card.scores.totalScore,
-      eligible: card.scores.eligible,
-      decisionText: card.scores.decisionText,
-      readyToSubmit: card.documentsComplete && card.securityCoversLiability && card.cibilComplete,
+      subscriber: personSummary(card.subscriber),
+      guarantors: card.guarantors.map(personSummary),
+      readyToSubmit: !!card.documentsComplete && !!card.securityCoversLiability && !!card.cibilComplete,
       guardStatus: {
         documentsComplete: card.documentsComplete,
         securityCoversLiability: card.securityCoversLiability,

@@ -1,60 +1,108 @@
 # MCF LOS — Score Card Module: Technical Documentation
 
+## Change Log — Credit Score Excel Rebuild
+
+This update replaces the module's entire scoring model with the one defined in
+**`Credit Score.xlsx`** (two sheets: **Employee** → `SALARIED` profile, **Business** →
+`BUSINESS` profile), per an explicit instruction to treat that workbook as the single
+source of truth and update the existing module to match it exactly, without rebuilding
+it from scratch. Everything else (auth, RBAC, workflow lifecycle, audit trail,
+versioning, security valuation, document upload) is unchanged.
+
+**What changed:**
+- **Scoring model replaced.** The previous **6-factor model** (CIBIL Score,
+  Income-EMI Coverage, Security Coverage/LTV, DPD History, Enquiry Count, Guarantor
+  Quality — engineering-default bands, never signed off by Credit Policy) is fully
+  removed. `src/modules/scorecard/scoring.engine.js` and its 45 tests are deleted.
+- **New model**: two independent, dropdown-driven parameter matrices (13
+  QUANTITATIVE + 7 QUALITATIVE parameters for `SALARIED`; 14 QUANTITATIVE + 7
+  QUALITATIVE for `BUSINESS`), each parameter answered by selecting one option from a
+  fixed list (QUANTITATIVE: `netScore = maxScore × option.weightage`) or a yes/no flag
+  (QUALITATIVE: a fixed penalty). See Section 5 and Section 19.
+- **Scoring moved from case-level to person-level.** The old model computed one
+  blended score per case (`SB × 60% + avg(guarantors) × 40%`). The Excel defines no
+  cross-person blending formula at all — each subscriber/guarantor now has their own
+  independent `totalScore`/`totalFinalScore`, scored against whichever profile
+  (`SALARIED`/`BUSINESS`) applies to *that person*. A case can freely mix profiles
+  (e.g. a salaried subscriber with a business guarantor).
+- **No eligibility threshold.** The old model's 75/60 decision thresholds
+  (`eligible`, `decisionText`) are removed — the Excel computes a Total Final Score
+  but defines no pass/fail cutoff on it. See Section 20, item 1.
+- **Database**: `scorecard_decision_band_master` dropped. New tables
+  `scorecard_parameter_master`, `scorecard_parameter_option_master` (the seeded
+  Excel matrix) and `score_card_person_responses` (one row per person per answered
+  parameter). `score_cards` and `score_card_persons` had their 6-factor/Annexure-era
+  columns (`gross_monthly_income`, `existing_obligations`, `proposed_emi`,
+  `total_score`, `eligible`, `decision_text`, `employment_type`, `entity_type`,
+  `credit_score`, `worst_dpd_days`, `enquiry_count_6m`, `gross_income`,
+  `net_income`) removed; `score_card_persons` gained `profile_type`, `total_score`,
+  `total_final_score`. See `db/schema.sql` and `db/seed_credit_score.sql`.
+- **API**: `Person` request/response shape is now `{ name, profileType, responses[] }`
+  instead of `{ name, employmentType, entityType, creditScore, worstDpdDays,
+  enquiryCount6Months, grossIncome, netIncome }`. `CreateScoreCardRequest` no longer
+  takes `grossMonthlyIncome`/`existingObligations`/`proposedEmi` (those were 6-factor
+  inputs only). New endpoint `GET /masters/credit-score-parameters?profileType=...`
+  exposes the dropdown matrix; `GET /masters/score-bands`, `/employment-types`,
+  `/entity-types` are removed (they described concepts — eligibility bands, a fixed
+  employment-type enum — the Excel does not define). `GET /score-cards` no longer
+  accepts an `eligible` filter. `ScoreSummary` returns per-person totals
+  (`subscriber`/`guarantors[]`, each with `totalScore`/`totalFinalScore`) instead of
+  case-level `factors`/`totalScore`/`eligible`/`decisionText`.
+- **What was preserved unchanged**: JWT auth, RBAC, the DRAFT → VALIDATED →
+  SUBMITTED → APPROVED/REJECTED lifecycle and its endpoints/URLs, audit logging,
+  version snapshots, the security Accepted Value Formula (Section 5.6), document
+  upload, and the three submit guards (`documentsComplete`, `securityCoversLiability`,
+  `cibilComplete`) — only *how* `cibilComplete` is derived changed (now: every person
+  has answered their profile's "CIBIL Score" parameter, rather than a non-null bureau
+  `creditScore` field).
+
+---
+
 ## 1. Executive Summary
 
 This service implements the **Score Card module** of the MCF Prize-Money-Against-Security
 Loan Origination System: the subscriber/guarantor credit-risk scoring step that runs
-before a loan application is submitted for scrutiny, and again — more formally — when
-the Credit Final Checker builds the Credit Appraisal Memo (CAM). It is a standalone REST
-API + PostgreSQL backend, independently deployable from the rest of MCF LOS.
+before a loan application is submitted for scrutiny. It is a standalone REST API +
+PostgreSQL backend, independently deployable from the rest of MCF LOS.
 
-The business logic implemented here draws on two authoritative documents, each
-covering a different part of the module:
+The scoring model implemented here is **`Credit Score.xlsx`**, taken verbatim as the
+single source of truth (see the Change Log above and Section 19). The workbook
+defines **two independent score cards**:
 
-1. **MuthootPappachan_LoanProcessing_FRD_v11** (Functional Requirements Document,
-   Version 2.0) — the Score Card completeness/validation gate (Section 10, "Key
-   System Validations & Business Rules"; Section 5.5 here), the Case Status
-   Workflow (Section 11), and the per-security-type **Accepted Value Formula**
-   (Section 6.1, Table 20; see Section 5.6 here). In this FRD, "Scorecard" refers
-   to a **document/data-completeness gate**, not a numeric points-based scoring
-   system — there is no point-matrix in the FRD itself.
-2. **The 6-factor scoring model** (CIBIL Score, Income-EMI Coverage, Security
-   Coverage/LTV, DPD History, Enquiry Count, Guarantor Quality — Section 5.1–5.4
-   here) — this is the numeric points system, confirmed against a UI reference
-   example (CIBIL 748 → ~15/20 checks out exactly on a linear scale). **The exact
-   band boundaries for the other five factors are engineering DEFAULTS, not yet
-   confirmed by Credit Policy** — see [Section 22 — Assumptions](#22-assumptions--open-questions)
-   for the full list of what still needs sign-off before this goes live. An
-   earlier, differently-structured scoring model ("Annexure 2" — Positive/Negative
-   scoring with Profile Strength/FOIR/Asset-Net-Worth sub-scores) was evaluated and
-   superseded by this 6-factor model at the Client's direction; it is no longer
-   used by this service.
+1. **Employee (Salaried)** → `profileType = SALARIED` — 13 QUANTITATIVE parameters
+   (max scores summing to 100) + 7 QUALITATIVE penalty flags.
+2. **Business (Self Employed / Business Profile)** → `profileType = BUSINESS` — 14
+   QUANTITATIVE parameters (also summing to 100) + the same 7 QUALITATIVE flags.
 
-The security valuation formula (Section 5.6) is grounded in the signed-off FRD and
-should be treated as authoritative. The 6-factor scoring bands (Section 5.1–5.4)
-are a proposed starting point, explicitly pending confirmation — treat every band
-boundary there as a hypothesis to be corrected during local testing, not a
-finished specification.
+Every QUANTITATIVE parameter is answered by picking exactly one option from a fixed
+dropdown list (its net score = the parameter's max score × the selected option's
+weightage, sourced from the Excel's own `VLOOKUP`). Every QUALITATIVE parameter is a
+yes/no flag carrying a fixed (negative) penalty if flagged. **Scoring is per-person**:
+the subscriber and each guarantor are scored independently, against whichever
+profile applies to them — the workbook has no formula that blends scores across
+people.
+
+The security valuation formula (Section 5.6) is unrelated to the Credit Score
+matrix and unchanged — it is grounded in the earlier, signed-off FRD (Functional
+Requirements Document) Section 6.1, Table 20, and remains authoritative.
 
 **What this service does:**
-- Accepts subscriber, guarantor, security, and income/EMI data for a loan
-  application — all meant to be system-sourced (bureau report pull, or carried
-  over from earlier application-intake steps), not manually re-typed at the
-  Score Card step itself.
-- Computes 6 factor scores (CIBIL Score, Income-EMI Coverage, Security Coverage,
-  DPD History, Enquiry Count, Guarantor Quality) summing to a total out of 100.
-- Maps the total score to a decision (Eligible for Approval / Conditional -
-  Manual Review Required / Not Eligible).
+- Loads the correct Credit Score parameter matrix for each person (via
+  `GET /masters/credit-score-parameters?profileType=...`) and accepts their answers
+  as `responses[]`.
+- Computes each person's `totalScore` (sum of QUANTITATIVE net scores) and
+  `totalFinalScore` (`totalScore` + sum of QUALITATIVE penalties) — instantly, on
+  every answer change, with zero hardcoded scoring values (all come from the DB,
+  seeded from the Excel).
 - Enforces the three guard conditions that gate submission (documents complete,
-  security covers future liability, CIBIL complete for every person).
+  security covers future liability, CIBIL Score parameter answered for every person).
 - Runs the full Draft → Validate → Submit → Approve/Reject lifecycle with a complete,
   immutable audit trail and version history.
 
 **What this service deliberately does not do:** originate the loan application itself,
-manage chit/auction data, handle disbursement, or replace the full 10-section CAM
-(sections A–J) used elsewhere in MCF LOS — those remain the responsibility of the
-main MCF LOS application; this service is the Score Card sub-module within it,
-callable standalone via its own API.
+manage chit/auction data, handle disbursement, define an eligibility/pass-fail
+threshold on the Total Final Score (the Excel does not define one — see Section 20),
+or replace the full 10-section CAM used elsewhere in MCF LOS.
 
 ---
 
@@ -65,13 +113,10 @@ callable standalone via its own API.
 ```mermaid
 flowchart LR
   A[Branch Initiator\ncreates application] --> B[Security & Guarantor\ndata captured]
-  B --> C[CIBIL check run]
-  C --> D["Score Card\n(this service)"]
-  D -->|guards pass| E[Submitted for\nBranch Scrutiny]
-  D -->|guards fail| B
+  B --> C["Score Card\n(this service)"]
+  C -->|guards pass| E[Submitted for\nBranch Scrutiny]
+  C -->|guards fail| B
   E --> F[... rest of MCF LOS\nworkflow continues ...]
-  F --> G[Credit Final Checker\nbuilds full CAM]
-  G -.->|re-uses the same\nscoring engine| D
 ```
 
 ### 2.2 Mandatory vs. optional fields
@@ -79,27 +124,24 @@ flowchart LR
 | Field | M/O | Notes |
 |---|---|---|
 | `applicationId` | Mandatory | Must match `MCF-YYYY-NNNNNN`; one score card per application |
-| `chitValue` | Mandatory | Also treated as the proposed loan amount for the Security Coverage factor |
+| `chitValue` | Mandatory | Proposed loan/prize amount; not an input to the Credit Score matrix |
 | `futureLiability` | Mandatory | Drives the `securityCoversLiability` guard |
 | `documentsComplete` | Mandatory (boolean, defaults false) | Drives one of the three submit guards |
-| `grossMonthlyIncome` | Mandatory | Income-EMI Coverage factor input |
-| `existingObligations` | Optional (defaults 0) | Income-EMI Coverage factor input |
-| `proposedEmi` | Mandatory | Income-EMI Coverage factor input; also the denominator for Guarantor Quality's income component |
-| `subscriber` | Mandatory | Full `Person` object — see Section 5 |
-| `guarantors` | Optional (0–4) | Absent guarantors mean Guarantor Quality defaults to a neutral 10/10 |
-| `securities` | Mandatory (min. 1) | Drives `securityTotalValue`, which feeds both the Security Coverage factor and the `securityCoversLiability` guard |
-| `subscriber.creditScore` | Optional at create, **mandatory before Validate can pass** | Bureau-fetched; see `cibilComplete` guard and the CIBIL Score factor |
-| `subscriber.worstDpdDays`, `subscriber.enquiryCount6Months` | Optional (null treated as clean/zero) | Bureau-fetched; feed the DPD History and Enquiry Count factors |
-| `entityType` | Conditional | Required only when `employmentType = "Business"`, forbidden otherwise |
+| `subscriber` | Mandatory | `{ name, profileType, responses[] }` — see Section 5 |
+| `subscriber.profileType` | Mandatory | `SALARIED` or `BUSINESS` — selects which Credit Score matrix this person is scored against |
+| `subscriber.responses[]` | Optional at create (may be partial — draft state); every QUANTITATIVE parameter answered is **mandatory before Validate can pass** | Each entry is `{parameterId, selectedOptionId}` (QUANTITATIVE) or `{parameterId, qualitativeFlag}` (QUALITATIVE) |
+| `guarantors` | Optional (0–4) | Each independently profiled/scored; a case may mix `SALARIED` and `BUSINESS` guarantors |
+| `securities` | Mandatory (min. 1) | Drives `securityTotalValue`, which feeds the `securityCoversLiability` guard (unrelated to the Credit Score matrix) |
 
 ### 2.3 Section dependencies
 
+- **A person's `responses[]` are only valid against their own `profileType`'s
+  parameter matrix** — a `parameterId` seeded under `BUSINESS` is rejected
+  (`ApiError.validation`) if referenced by a `SALARIED` person's response, and vice
+  versa (`src/modules/scorecard/creditScoreEngine.js`).
 - **Security Coverage depends on Securities** — the accepted security value must be
-  computed (Section 5.6) before the Security Coverage factor (Section 5.2) can run,
-  so `securities` is required at creation, not deferred to a later step.
-- **Guarantor Quality depends on `proposedEmi`** — the income-adequacy component is
-  a ratio against `proposedEmi`, so that field must be present even if there is no
-  guarantor (in which case the factor is skipped entirely and defaults to 10).
+  computed (Section 5.6) before the `securityCoversLiability` guard can evaluate, so
+  `securities` is required at creation, not deferred to a later step.
 - **Submit depends on Validate** — `POST /submit` will reject with
   `INVALID_STATE_FOR_SUBMIT` unless the card is already `VALIDATED`; validation is not
   an implicit side-effect of submit, by design, so a UI can show the client exactly
@@ -114,29 +156,32 @@ flowchart LR
 ```
 scorecardapi/
 ├── db/
-│   ├── schema.sql          # full DDL — tables, constraints, indexes, triggers
-│   └── seed.sql            # master data + demo users (mirrors live MCF LOS config)
+│   ├── schema.sql               # full DDL — tables, constraints, indexes, triggers
+│   ├── seed.sql                  # master data + demo users (mirrors live MCF LOS config)
+│   └── seed_credit_score.sql      # GENERATED from Credit Score.xlsx — the parameter/option matrix
 ├── src/
 │   ├── app.js               # Express app assembly (security middleware, routes, /docs)
 │   ├── server.js            # process entrypoint, graceful shutdown
 │   ├── config/               # env.js, db.js (pg Pool + withTransaction helper)
 │   ├── middleware/            # auth (JWT), rbac, validate (Joi), sanitize, errorHandler
 │   ├── modules/
-│   │   ├── auth/                # login/refresh
-│   │   ├── scorecard/            # the module itself: routes/controller/service/repository
-│   │   │   └── scoring.engine.js  # <- the pure calculation engine (zero DB/HTTP deps)
-│   │   └── masters/              # dropdown reference data
+│   │   ├── auth/                          # login/refresh
+│   │   ├── scorecard/                      # the module itself: routes/controller/service/repository
+│   │   │   ├── creditScoreEngine.js         # <- pure calculation engine (zero DB/HTTP deps)
+│   │   │   └── parameterDefs.repository.js   # loads the parameter+option matrix for a profileType
+│   │   └── masters/                        # dropdown reference data, incl. credit-score-parameters
 │   └── utils/                    # ApiError, apiResponse envelope, pagination
-├── tests/                          # 119 automated tests (see Section 14)
+├── tests/                          # automated tests (see Section 14)
 ├── openapi.yaml                     # full OpenAPI 3.0 spec, served at GET /docs
 └── DOCUMENTATION.md                  # this file
 ```
 
-**Layering (routes → controller → service → repository → DB):** the `scoring.engine.js`
-module is intentionally the only place the 6-factor scoring math lives, with zero
-dependency on Express or `pg` — it is unit-testable in complete isolation (see the 45
-tests in `tests/scoring.engine.test.js`), and could be lifted into a batch/offline
-recompute job unchanged.
+**Layering (routes → controller → service → repository → DB):** `creditScoreEngine.js`
+is the only place the scoring math lives, with zero dependency on Express or `pg` and
+**zero hardcoded scoring values** — every max score, option label and weightage is
+loaded from the database (seeded verbatim from `Credit Score.xlsx`) and passed in by
+the caller. It is unit-testable in complete isolation (see `tests/creditScoreEngine.test.js`)
+and could be lifted into a batch/offline recompute job unchanged.
 
 ---
 
@@ -151,6 +196,9 @@ erDiagram
   score_cards ||--o{ score_card_documents : "has"
   score_cards ||--o{ score_card_versions : "has history"
   score_cards ||--o{ score_card_audit_logs : "logs"
+  score_card_persons ||--o{ score_card_person_responses : "answers"
+  scorecard_parameter_master ||--o{ scorecard_parameter_option_master : "options"
+  scorecard_parameter_master ||--o{ score_card_person_responses : "answered by"
   role_master ||--o{ app_user : "assigned"
   app_user ||--o{ score_cards : "created_by"
   security_type_master ||--o{ score_card_securities : "type"
@@ -160,19 +208,41 @@ erDiagram
     varchar application_id UK
     int version
     varchar status
-    numeric gross_monthly_income
-    numeric proposed_emi
-    numeric total_score
-    boolean eligible
+    numeric chit_value
+    numeric future_liability
+    boolean security_covers_liability
+    boolean cibil_complete
     boolean is_deleted
   }
   score_card_persons {
     bigserial id PK
     uuid score_card_id FK
     varchar person_role
-    int credit_score
-    int worst_dpd_days
-    int enquiry_count_6m
+    varchar profile_type
+    numeric total_score
+    numeric total_final_score
+  }
+  score_card_person_responses {
+    bigserial id PK
+    bigint score_card_person_id FK
+    bigint parameter_id FK
+    bigint selected_option_id FK
+    boolean qualitative_flag
+    numeric net_score
+  }
+  scorecard_parameter_master {
+    bigserial id PK
+    varchar profile_type
+    varchar sl_no
+    text name
+    varchar category
+    numeric max_score
+  }
+  scorecard_parameter_option_master {
+    bigserial id PK
+    bigint parameter_id FK
+    text option_label
+    numeric weightage
   }
   score_card_securities {
     bigserial id PK
@@ -195,7 +265,14 @@ erDiagram
   }
 ```
 
-Full DDL: [`db/schema.sql`](db/schema.sql). Highlights:
+Full DDL: [`db/schema.sql`](db/schema.sql); seeded parameter/option data:
+[`db/seed_credit_score.sql`](db/seed_credit_score.sql) (generated from
+`Credit Score.xlsx` — see Section 19). Highlights:
+- **No duplicate mappings, enforced at the DB level**: `UNIQUE (profile_type, sl_no)`
+  on `scorecard_parameter_master`, `UNIQUE (parameter_id, option_label)` on
+  `scorecard_parameter_option_master`, `UNIQUE (score_card_person_id, parameter_id)`
+  on `score_card_person_responses` — a person cannot have two answers for the same
+  parameter.
 - **Soft delete** on `score_cards` and `score_card_documents` (`is_deleted`,
   `deleted_at`, `deleted_by`) — nothing is ever hard-deleted through the API.
 - **Versioning**: `score_card_versions` stores an immutable JSONB snapshot on every
@@ -212,93 +289,64 @@ Full DDL: [`db/schema.sql`](db/schema.sql). Highlights:
 
 ## 5. Business Rules
 
-### 5.1 The 6 scoring factors (sum to 100)
+### 5.1 Two independent Credit Score Cards
 
-> **These band boundaries are engineering defaults, not yet confirmed by Credit
-> Policy** — see [Section 22](#22-assumptions--open-questions) for the
-> full confirmation checklist. The only value independently verified against a
-> reference example is the CIBIL Score factor (748 → 14.93/20, exact match on a
-> linear 300–900 scale).
+`Credit Score.xlsx` defines two separate sheets, each an independent parameter
+matrix — no parameter from one appears in the other:
 
-| # | Factor | Max | Input(s) | Source |
+| Profile | `profileType` | QUANTITATIVE parameters | Max-score sum | QUALITATIVE parameters |
 |---|---|---|---|---|
-| 1 | CIBIL Score | 20 | `subscriber.creditScore` | Bureau report pull |
-| 2 | Income-EMI Coverage | 20 | `grossMonthlyIncome`, `existingObligations`, `proposedEmi` | Application intake |
-| 3 | Security Coverage / LTV | 15 | accepted security value vs. `chitValue` (proposed loan amount) | Computed (Section 5.6) |
-| 4 | DPD History | 20 | `subscriber.worstDpdDays` | Bureau report pull |
-| 5 | Enquiry Count | 15 | `subscriber.enquiryCount6Months` | Bureau report pull |
-| 6 | Guarantor Quality | 10 | first guarantor's `creditScore` + income vs. `proposedEmi` | Bureau + application intake |
+| Employee (Salaried) | `SALARIED` | 13 | 100 | 7 (shared wording/penalties with BUSINESS) |
+| Business (Self Employed / Business Profile) | `BUSINESS` | 14 | 100 | 7 |
 
-All bureau-sourced inputs (CIBIL score, DPD history, enquiry count) are meant to
-be populated by an upstream bureau-integration call — **not typed in manually by
-the Branch Initiator at the Score Card step**. This is the core principle
-confirmed with the Client: the Score Card auto-computes from data already
-captured earlier in the application flow plus the CIBIL fetch, not from
-free-text entry at the scorecard screen itself.
+Every person (subscriber or guarantor) on a score card carries their own
+`profileType` and is scored **only** against that profile's matrix
+(`GET /masters/credit-score-parameters?profileType=...`). A case may freely mix
+profiles across its people (e.g. a `SALARIED` subscriber with a `BUSINESS`
+guarantor) — this is a structural feature of the model, not a special case.
 
-### 5.2 Factor formulas
+### 5.2 QUANTITATIVE parameters — dropdown/lookup scoring
 
-1. **CIBIL Score (max 20)** — linear scale: `clamp((creditScore − 300) / 600 × 20, 0, 20)`.
-2. **Income-EMI Coverage (max 20)** — FOIR band on `(existingObligations + proposedEmi) / grossMonthlyIncome`:
+Each QUANTITATIVE parameter (e.g. "Age", "Occupation", "CIBIL Score", "Monthly Chit
+Subscription to Net Income") is answered by selecting **exactly one** option from a
+fixed list. The Excel's own dropdown validation on each "selector" cell is the
+authoritative option list — reproduced verbatim in
+`scorecard_parameter_option_master`.
 
-   | FOIR | Score |
-   |---|---|
-   | < 30% | 20 |
-   | 30–44% | 15 |
-   | 45–59% | 10 |
-   | 60–74% | 7.5 |
-   | 75–94% | 5 |
-   | ≥ 95% | 0 |
+```
+netScore = parameter.maxScore × selectedOption.weightage
+```
 
-3. **Security Coverage / LTV (max 15)** — band on `acceptedSecurityValue / chitValue`:
+`weightage` is a 0–1 ratio taken directly from the Excel's weightage column (the
+value its own `VLOOKUP` formula resolves to). There are no hardcoded scoring values
+anywhere in `creditScoreEngine.js` — every max score, option label and weightage is
+loaded from the database.
 
-   | Coverage ratio | Score |
-   |---|---|
-   | ≥ 125% | 15 |
-   | 100–124% | 12 |
-   | 80–99% | 9 |
-   | 60–79% | 6 |
-   | 40–59% | 3 |
-   | < 40% | 0 |
+An unanswered QUANTITATIVE parameter contributes `0` and is not "wrong" — it simply
+represents a still-in-progress draft; `isFullyAnswered()` is what the Validate guard
+uses to require every parameter be answered before submission.
 
-4. **DPD History (max 20)** — band on worst days-past-due in the bureau report:
+`Total Score` (a person's `totalScore`) = the sum of all their QUANTITATIVE net
+scores. Since each profile's max scores sum to exactly 100, a fully-answered
+person's `totalScore` is out of 100.
 
-   | Worst DPD | Score |
-   |---|---|
-   | None / 0 (clean) | 20 |
-   | 1–29 days | 14 |
-   | 30–59 days | 8 |
-   | 60–89 days | 4 |
-   | 90+ days | 0 |
+### 5.3 QUALITATIVE parameters — yes/no penalty flags
 
-5. **Enquiry Count (max 15)** — band on hard enquiries in the last 6 months:
+The same 7 QUALITATIVE parameters apply to both profiles (identical fixed
+penalties; one label's wording differs slightly per profile — see Section 19):
+Politically influenced (−100), Constitutional position (−100), Police Department
+(−100), Lawyer/advocate (−50), Trouble shooter/Litigant (−80), Critical illness
+(−50), Recently hospitalized (−50).
 
-   | Enquiries | Score |
-   |---|---|
-   | 0 | 15 |
-   | 1–2 | 12 |
-   | 3–4 | 8 |
-   | 5–6 | 4 |
-   | 7+ | 0 |
+```
+netScore = flagged ? parameter.maxScore : 0     // maxScore is already negative
+```
 
-6. **Guarantor Quality (max 10)** — `cibilComponent (max 6) + incomeComponent (max 4)`.
-   No guarantor present → neutral full marks (10), since a guarantor is
-   conditional, not mandatory (FRD Section 6.2).
-   - `cibilComponent = clamp((guarantor.creditScore − 300) / 600 × 6, 0, 6)`
-   - `incomeComponent`: guarantor income ÷ `proposedEmi` ratio ≥1.5→4, ≥1.0→3, ≥0.5→2, else 0.
-   - **Only the first guarantor feeds this factor** — an explicit simplification;
-     see [Section 22](#22-assumptions--open-questions) if multi-guarantor
-     averaging is wanted instead.
+Unlike QUANTITATIVE parameters, QUALITATIVE flags always default to un-flagged
+(`false`) rather than "unanswered" — the Excel's example rows show all seven at 0.
 
-### 5.3 Decision thresholds
-
-`totalScore = ` sum of all 6 factors (max 100).
-
-| Total Score | Decision | `eligible` |
-|---|---|---|
-| ≥ 75 | Eligible for Approval | `true` |
-| 60–74.99 | Conditional - Manual Review Required | `false` |
-| < 60 | Not Eligible | `false` |
+`Total Final Score` (a person's `totalFinalScore`) = `totalScore` + the sum of all
+their QUALITATIVE net scores (penalties).
 
 ### 5.4 Submit guards (mandatory conditions)
 
@@ -307,9 +355,11 @@ A score card can only move `DRAFT → VALIDATED` (and therefore only be submitte
 `workflow-engine.js` enforces at the `BRANCH_WIP → SCRUTINY_PENDING` transition:
 
 1. `documentsComplete = true`
-2. `securityTotalValue >= futureLiability` (`securityCoversLiability`)
-3. Every person (subscriber + all guarantors) has a non-null `creditScore`
-   (`cibilComplete`)
+2. `securityTotalValue >= futureLiability` (`securityCoversLiability`) — unrelated to
+   the Credit Score matrix; see Section 5.6.
+3. Every person (subscriber + all guarantors) has answered their profile's "CIBIL
+   Score" parameter (`cibilComplete`) — i.e. has a `selectedOptionId` for it, not
+   necessarily any particular band.
 
 ### 5.5 Role-wise restrictions
 
@@ -319,11 +369,11 @@ or reject a submitted card; only **ADMIN** currently holds `auditView`.
 
 ### 5.6 Security Accepted Value Formula (FRD Section 6.1, Table 20)
 
-`valueLoaded` — the amount of a security's value actually counted toward covering
-the Future Liability — is **always computed server-side** (`src/modules/scorecard/securityValuation.js`)
-from type-specific raw inputs. It is **never** accepted as a raw number from the
-client; doing so would let a caller bypass the accepted-value rule entirely. This
-is a flat, per-type formula table — **not** a uniform LTV-cap percentage.
+Unrelated to the Credit Score matrix and unchanged by this update. `valueLoaded` —
+the amount of a security's value actually counted toward covering the Future
+Liability — is **always computed server-side**
+(`src/modules/scorecard/securityValuation.js`) from type-specific raw inputs. It is
+**never** accepted as a raw number from the client.
 
 | Security Type | Required Input(s) | Accepted Value Formula |
 |---|---|---|
@@ -336,40 +386,39 @@ is a flat, per-type formula table — **not** a uniform LTV-cap percentage.
 | Chit Passbook (Pledge) | `apiSourcedValue` | "As per API" — accepted as given, not computed |
 | Mortgage (Property) | `forcedSaleValue` | `(forcedSaleValue ÷ 150) × 100` |
 | Demat Shares | `marketValue`, `liabilityToSecure` | `liabilityToSecure < ₹2L` → `50% × marketValue`; else `min(50% × marketValue, 40% × liabilityToSecure)` |
-| Personal Surety | — | 0 (no tangible security value; guarantor net worth is assessed separately per FRD Section 6.2) |
+| Personal Surety | — | 0 (no tangible security value) |
 
-> **Note on naming**: the FRD's Table 20 uses slightly different literal wording
-> for some rows (e.g. "Gold" not "Gold Ornaments", "Chit Passbook Pledge" not "Chit
-> Passbook", "Deposit with Group Co. (Sub-Debt)" not "Sub-Debt"). This service uses
-> the canonical security-type names already in use across the rest of MCF LOS
-> (`assets/json/security-types.json`) so this API keys against the same identifiers
-> every other MCF LOS screen already uses — only the **formula** is taken from the
-> FRD, not the exact row labels.
->
-> `security_type_master.ltv_cap` (seeded from the earlier, simpler LTV-cap model)
-> is retained for informational/dropdown display only — it is **not** used by
-> `computeAcceptedValue()` and should not be treated as authoritative for accepted-value
-> calculations.
+> `security_type_master.ltv_cap` is retained for informational/dropdown display
+> only — it is **not** used by `computeAcceptedValue()`.
 
 ---
 
 ## 6. Calculation Engine Reference
 
-Implemented in [`src/modules/scorecard/scoring.engine.js`](src/modules/scorecard/scoring.engine.js),
-covered by 45 unit tests. Calculation sequence for one score card:
+Implemented in [`src/modules/scorecard/creditScoreEngine.js`](src/modules/scorecard/creditScoreEngine.js),
+covered by `tests/creditScoreEngine.test.js`. Calculation sequence for **one person**:
 
-1. `securityTotalValue` = sum of `valueLoaded` across all securities (each already
-   server-computed per the Section 5.6 formula).
-2. `cibilFactorScore(subscriber.creditScore)` → factor 1 (max 20).
-3. `incomeEmiCoverageScore(grossMonthlyIncome, existingObligations, proposedEmi)` → factor 2 (max 20).
-4. `securityCoverageScore(securityTotalValue, chitValue)` → factor 3 (max 15).
-5. `dpdHistoryScore(subscriber.worstDpdDays)` → factor 4 (max 20).
-6. `enquiryCountScore(subscriber.enquiryCount6Months)` → factor 5 (max 15).
-7. `guarantorQualityScore(guarantors[0] || null, proposedEmi)` → factor 6 (max 10).
-8. `totalScore` = sum of factors 1–6 (rounded to 2 decimals).
-9. `decisionFor(totalScore)` → `{ eligible, decisionText }` (Section 5.3 thresholds).
-10. Guard booleans (`documentsComplete`, `securityCoversLiability`, `cibilComplete`) are
-    derived and `readyToSubmit` = AND of all three.
+1. `parameterDefs` for that person's `profileType` are loaded (`parameterDefs.repository.js`)
+   — the ordered list of parameters, each with its options (QUANTITATIVE) or fixed
+   penalty (QUALITATIVE).
+2. For each QUANTITATIVE parameter: if the person answered it (`selectedOptionId`
+   present), look up that option among the parameter's own options — an option
+   belonging to a *different* parameter is rejected with `ApiError.validation` — and
+   compute `maxScore × option.weightage`. If unanswered, `netScore = 0`,
+   `answered = false`.
+3. For each QUALITATIVE parameter: `netScore = flagged ? maxScore : 0`.
+4. `totalScore` = sum of all QUANTITATIVE net scores (rounded to 2 decimals).
+5. `totalPenalty` = sum of all QUALITATIVE net scores (rounded to 2 decimals).
+6. `totalFinalScore` = `totalScore + totalPenalty`.
+7. `isFullyAnswered()` — true once every QUANTITATIVE parameter has a
+   `selectedOptionId` — used to require a complete Credit Score sheet before Validate.
+8. `hasCibilResponse()` — true once the parameter whose name matches `/cibil/i` has
+   a `selectedOptionId` — this is what `cibilComplete` (Section 5.4) is built from,
+   evaluated once per person and ANDed across the whole card.
+9. Security guards (`securityTotalValue`, `securityCoversLiability`,
+   `documentsComplete`) are computed independently of the above, from `securities`/
+   `futureLiability`/`documentsComplete` (Section 5.6) — the Excel has no formula
+   relating them to the Credit Score matrix.
 
 ---
 
@@ -392,9 +441,8 @@ stateDiagram-v2
 
 > **`UNDER_REVIEW` is reserved, not yet reachable in v1.** The status enum and the
 > Approve/Reject guards already accept it (`SUBMITTED` or `UNDER_REVIEW`), anticipating
-> a future "Start Review" action that would mark a card as actively being looked at.
-> No v1 endpoint transitions a card into `UNDER_REVIEW` — this is flagged explicitly in
-> [Section 22](#22-assumptions--open-questions) rather than silently left dead.
+> a future "Start Review" action. No v1 endpoint transitions a card into
+> `UNDER_REVIEW` — flagged explicitly in [Section 20](#20-open-questions).
 
 ### 7.1 Sequence diagram — happy path
 
@@ -406,12 +454,12 @@ sequenceDiagram
     participant FC as Credit Final Checker
 
     BI->>API: POST /score-cards
-    API->>DB: INSERT score_cards + persons + securities (txn)
+    API->>DB: INSERT score_cards + persons + person_responses + securities (txn)
     DB-->>API: card (DRAFT, v1)
     API-->>BI: 201 Created
 
     BI->>API: POST /score-cards/:id/validate
-    API->>DB: recompute + read guard inputs
+    API->>DB: recompute every person + re-check guard inputs
     alt all guards pass
         API->>DB: UPDATE status=VALIDATED, INSERT version snapshot, INSERT audit log
         API-->>BI: 200 { valid: true }
@@ -451,21 +499,19 @@ sequenceDiagram
 - **Row-level ownership**: a role holding only `caseViewOwn` (BI, FI) may act on a
   score card only if `created_by` matches their user id; roles holding `caseViewAll`
   may act on any record. A request for a **non-existent** record always yields 404,
-  never 403 — see the fix documented in `rbac.js`'s `requireOwnershipOrViewAll`.
+  never 403.
 - **Input sanitization**: `src/middleware/sanitize.js` strips `<script>` tags and null
   bytes from every string in `body`/`query`/`params`, as defence-in-depth.
-- **SQL injection prevention**: every query in `scorecard.repository.js` uses
-  parameterised placeholders (`$1, $2, ...`) — no string concatenation of untrusted
-  input into SQL, anywhere.
+- **SQL injection prevention**: every query in `scorecard.repository.js` (and
+  `parameterDefs.repository.js`) uses parameterised placeholders (`$1, $2, ...`) —
+  no string concatenation of untrusted input into SQL, anywhere.
 - **XSS protection**: `helmet()` sets standard security headers; all API responses are
-  `application/json` (never reflected HTML), which is the primary XSS defence for a
-  pure JSON API.
+  `application/json` (never reflected HTML).
 - **Audit logging**: every mutating action writes exactly one row to
   `score_card_audit_logs` with actor, role, IP, user-agent, old/new value JSON, and
   timestamp — see Section 13.
 - **Encryption for sensitive data**: passwords are bcrypt-hashed (never stored
-  plaintext); TLS termination is expected at the load balancer/ingress (see Section 16)
-  — the app itself does not terminate TLS.
+  plaintext); TLS termination is expected at the load balancer/ingress.
 
 ---
 
@@ -488,6 +534,7 @@ Every error response uses the same envelope (`src/middleware/errorHandler.js`):
 | Scenario | HTTP | `code` |
 |---|---|---|
 | Field fails Joi validation | 422 | `VALIDATION_ERROR` |
+| `selectedOptionId` does not belong to the given `parameterId` | 422 | `VALIDATION_ERROR` |
 | Business/workflow rule violated (wrong status for this action) | 422 | e.g. `INVALID_STATE_FOR_SUBMIT` |
 | Missing/invalid/expired JWT | 401 | `UNAUTHORIZED` |
 | Authenticated but lacks permission | 403 | `FORBIDDEN` |
@@ -504,20 +551,20 @@ Every error response uses the same envelope (`src/middleware/errorHandler.js`):
 - **Pagination**: every list endpoint (`GET /score-cards`, `/history`, `/audit-logs`)
   is paginated (`page`, `pageSize`, max 100) with a `meta` block (`totalRecords`,
   `totalPages`).
-- **Filtering & sorting**: `GET /score-cards` supports `status`, `eligible`,
-  `applicationId`, `createdBy`, `fromDate`/`toDate`, and a whitelisted `sort` field
-  (rejecting arbitrary column names prevents SQL-injection-via-ORDER-BY).
+- **Filtering & sorting**: `GET /score-cards` supports `status`, `applicationId`,
+  `createdBy`, `fromDate`/`toDate`, and a whitelisted `sort` field (rejecting
+  arbitrary column names prevents SQL-injection-via-ORDER-BY). There is no `eligible`
+  filter — the model has no eligibility concept (Section 20).
 - **Indexes**: partial unique index on `score_cards(application_id) WHERE NOT
   is_deleted`; indexes on `status`, `created_by`; every child table indexed on its
-  `score_card_id` FK; audit logs indexed on `(score_card_id, created_at DESC)` and
-  `(application_id, created_at DESC)`.
+  `score_card_id`/`score_card_person_id` FK; `scorecard_parameter_master` indexed on
+  `(profile_type, display_order)`; audit logs indexed on `(score_card_id, created_at DESC)`.
 - **Transactions**: every multi-statement mutation (create, update, status
   transitions) runs inside `withTransaction()` — a single connection, `BEGIN`, and
   automatic `ROLLBACK` on any thrown error (see `config/db.js`).
-- **Caching**: not implemented in v1 — score card reads are per-application and
-  low-volume relative to a typical LOS's read patterns; flagged as an open
-  enhancement in Section 22 if the dropdown-master endpoints need response caching
-  under load.
+- **Caching**: not implemented in v1 — the parameter/option matrix is small (41 rows +
+  161 options total) and rarely changes; flagged as an open enhancement in Section 20
+  if the masters endpoints need response caching under load.
 - **Connection pooling**: `pg.Pool` with `max: 20`, 30s idle timeout, 5s connect
   timeout.
 
@@ -528,10 +575,10 @@ Every error response uses the same envelope (`src/middleware/errorHandler.js`):
 | System | Direction | Purpose | Status |
 |---|---|---|---|
 | Main MCF LOS application | Inbound | Creates/reads score cards keyed by `applicationId` | Primary caller |
-| Credit Bureau (CIBIL/Equifax/CRIF) | External, upstream of this API | Supplies `creditScore` per person — this service does not call the bureau itself | Out of scope — see the Client Requirement doc |
-| Document Management / Object Storage | External, upstream | `POST /documents` stores only a `fileUrl` reference — actual file bytes are uploaded directly to storage (S3/Azure Blob) by the caller, typically via a pre-signed URL | Out of scope for this service |
-| Rule Engine | N/A | The scoring/deviation rules are implemented directly in `scoring.engine.js`, not delegated to an external rules engine, for auditability and unit-testability | By design |
-| Workflow/Case API (main LOS) | Bidirectional | The main LOS's `WorkflowEngine.transition('submitForScrutiny', ...)` should be called by the orchestrating layer once this service's `/submit` succeeds | Integration contract — see Assumptions |
+| Credit Bureau (CIBIL/Equifax/CRIF) | External, informs the caller | The "CIBIL Score" parameter is a band dropdown (e.g. "750 and above", "700 to 749", ...) the caller selects based on a bureau report pull done upstream — this service does not call the bureau itself | Out of scope for this service |
+| Document Management / Object Storage | External, upstream | `POST /documents` stores only a `fileUrl` reference — actual file bytes are uploaded directly to storage by the caller | Out of scope for this service |
+| Rule Engine | N/A | The scoring rules are implemented directly in `creditScoreEngine.js` against DB-seeded parameter definitions, not delegated to an external rules engine, for auditability and unit-testability | By design |
+| Workflow/Case API (main LOS) | Bidirectional | The main LOS's `WorkflowEngine.transition('submitForScrutiny', ...)` should be called by the orchestrating layer once this service's `/submit` succeeds | Integration contract — see Section 20 |
 
 ---
 
@@ -540,10 +587,7 @@ Every error response uses the same envelope (`src/middleware/errorHandler.js`):
 `POST /score-cards/:id/documents` accepts a **reference** (`fileUrl`) rather than raw
 file bytes. The expected flow: caller requests a pre-signed upload URL from its
 document storage provider, uploads the file directly to storage, then calls this
-endpoint with the resulting URL to attach it to the score card. This keeps the API
-stateless with respect to file bytes and avoids duplicating storage infrastructure
-that (per the companion Client Requirement document) the Client's IT team already
-owns.
+endpoint with the resulting URL to attach it to the score card.
 
 ---
 
@@ -570,14 +614,14 @@ version history tells you *exactly what it looked like* at that point in time.
 
 ## 14. Test Cases
 
-119 automated tests, all passing against a real PostgreSQL instance (not mocked):
+98 automated tests, all passing against a real PostgreSQL instance (not mocked):
 
-| File | Count | Covers |
-|---|---|---|
-| `tests/scoring.engine.test.js` | 45 | Every one of the 6 factors' bands/boundaries (Section 5.2), incl. the exact CIBIL-748 reference example |
-| `tests/securityValuation.test.js` | 19 | Every security type's Accepted Value Formula (Section 5.6 / FRD Table 20), incl. the Demat Shares ₹2L boundary and missing-required-field errors |
-| `tests/scorecard.validation.test.js` | 20 | Joi schema positive/negative/boundary cases, incl. SQL-injection-shaped and oversized inputs |
-| `tests/scorecard.api.test.js` | 35 | Full HTTP lifecycle: auth, RBAC (positive + negative per role), guard failures, status-transition rule violations, pagination/filtering/sorting, soft delete, audit/history endpoints |
+| File | Covers |
+|---|---|
+| `tests/creditScoreEngine.test.js` | The Excel-verified reference example (SALARIED total = 76.5); lowest/highest/fractional weightage boundaries for both profiles; unanswered-parameter draft state; QUALITATIVE flag on/off; rejecting an option that belongs to a different parameter; `isFullyAnswered`/`hasCibilResponse` guards |
+| `tests/securityValuation.test.js` | Every security type's Accepted Value Formula (Section 5.6 / FRD Table 20), incl. the Demat Shares ₹2L boundary and missing-required-field errors |
+| `tests/scorecard.validation.test.js` | Joi schema positive/negative/boundary cases for the `{name, profileType, responses[]}` Person shape (duplicate parameterId rejection, xor of selectedOptionId/qualitativeFlag), incl. SQL-injection-shaped and oversized inputs |
+| `tests/scorecard.api.test.js` | Full HTTP lifecycle: auth, RBAC (positive + negative per role), both profiles (incl. a mixed-profile case), guard failures (incl. CIBIL-unanswered), status-transition rule violations, draft/partial answers, recalculation, pagination/filtering/sorting, soft delete, audit/history/summary endpoints, the `credit-score-parameters` masters endpoint |
 
 Run locally:
 ```bash
@@ -593,15 +637,18 @@ npm test
 
 ## 15. Developer Notes
 
-- **Never** change a formula in `scoring.engine.js` without a corresponding, signed-off
-  change to the Risk Assessment Annexure — that file's header comment says this too;
-  treat it as load-bearing documentation, not decoration.
+- **Never** hand-edit a scoring value in the database or in code** — every max score,
+  option label and weightage must come from re-running the extraction against
+  `Credit Score.xlsx` and regenerating `db/seed_credit_score.sql`; that file's header
+  comment says the same. `creditScoreEngine.js` itself has zero hardcoded scoring
+  constants by design, precisely so this can never silently drift from the workbook.
 - The `id` path param is always the internal UUID (`score_cards.id`), never the
   external `applicationId` — use `GET /score-cards/application/:applicationId` when
   you only have the latter.
 - `PUT` vs `PATCH /draft`: `PUT` recomputes scores and can flip `VALIDATED → DRAFT`;
   `PATCH /draft` is a pure persistence operation with **no** guard/status side-effects,
-  for the "still typing" autosave case.
+  for the "still typing" autosave case — a person's `responses[]` may be a partial
+  subset of their profile's parameters in a draft.
 - `POST /validate` returns **HTTP 200 with `data.valid: true`** on success, and
   **HTTP 422 with `data.valid: false`** on guard failure — 422 here is not a generic
   server-side validation error, it's a legitimate, expected business outcome; check
@@ -619,15 +666,14 @@ npm test
   git-ignored.
 - **TLS**: this app does not terminate TLS itself — deploy behind a load balancer,
   API gateway, or reverse proxy that does.
-- **Migrations**: `db/schema.sql` and `db/seed.sql` are plain SQL, run once per
-  environment via `npm run db:migrate` / `npm run db:seed`. For ongoing schema
+- **Migrations**: `db/schema.sql`, `db/seed.sql` **and `db/seed_credit_score.sql`**
+  are plain SQL, run once per environment (`npm run db:migrate` / `npm run db:seed`
+  — the latter now runs all three files, see `package.json`). For ongoing schema
   evolution beyond this initial version, adopt a migration tool (e.g. `node-pg-migrate`
-  or `Flyway`) rather than hand-editing `schema.sql` in place — flagged as a Section 22
-  open item since v1 ships with a single baseline script.
+  or `Flyway`) rather than hand-editing `schema.sql` in place.
 - **Health check**: `GET /health` (no auth) for load-balancer/container-orchestrator
   liveness probes.
-- **API docs**: `GET /docs` serves the Swagger UI from `openapi.yaml` — disable or
-  gate behind auth in production if the spec itself should not be publicly browsable.
+- **API docs**: `GET /docs` serves the Swagger UI from `openapi.yaml`.
 - **Graceful shutdown**: `SIGINT`/`SIGTERM` close the HTTP server and drain the PG
   pool before exiting (see `src/server.js`).
 
@@ -651,7 +697,7 @@ npm test
 | 12 | Get Score Summary | GET | `/score-cards/:id/summary` |
 | 13 | Get Score History | GET | `/score-cards/:id/history` |
 | 14 | Get Audit Logs | GET | `/score-cards/:id/audit-logs` |
-| 15 | Get Dropdown Masters | GET | `/masters/security-types`, `/score-bands`, `/employment-types`, `/entity-types`, `/document-types`, `/roles` |
+| 15 | Get Dropdown Masters | GET | `/masters/security-types`, `/credit-score-parameters`, `/document-types`, `/roles` |
 | 16 | Upload Supporting Documents | POST | `/score-cards/:id/documents` |
 | — | List (pagination/filter/sort) | GET | `/score-cards` |
 | — | Login / Refresh | POST | `/auth/login`, `/auth/refresh` |
@@ -663,28 +709,96 @@ Full request/response schemas, examples, and error codes for every one of the ab
 
 ## 18. Compliance Note: What This Document Assumes vs. Confirms
 
-Consistent with the companion *Client Requirement & Technical Dependency Document*,
-this service is built from the Risk Assessment Annexure and the live MCF LOS
-prototype's implementation of it — treated as the best-available source of truth, not
-as a document the Client has necessarily re-confirmed line-by-line for this
-standalone API. Anything below that is genuinely new (not already in the prototype)
-is called out explicitly as an assumption.
+The Credit Score matrix (Sections 5.1–5.3, 19) is taken **verbatim** from
+`Credit Score.xlsx`, provided as the explicit single source of truth — every
+parameter, option, weightage and max score is a direct transcription (see Section 19
+and the extraction verification described there), not an engineering estimate. The
+security valuation formula (Section 5.6) remains grounded in the earlier, signed-off
+FRD. Anything not settled by either document is called out in Section 20.
 
-## 22. Assumptions & Open Questions
+---
+
+## 19. Excel-to-Application Mapping
+
+`Credit Score.xlsx` → `db/seed_credit_score.sql` → `scorecard_parameter_master` /
+`scorecard_parameter_option_master` → `GET /masters/credit-score-parameters` →
+`Person.responses[]` → `score_card_person_responses` → `Person.totalScore`/`totalFinalScore`.
+
+Every parameter below was verified during extraction by reproducing the Excel's own
+cached `VLOOKUP` result for its example-selected option (100% match, all 27
+parameters) before being transcribed into `db/seed_credit_score.sql`; full option-level
+detail (all 161 options with their exact weightages) lives in that file, generated
+programmatically from the verified extraction rather than hand-typed.
+
+### 19.1 SALARIED (Employee sheet) — 13 QUANTITATIVE + 7 QUALITATIVE, max scores sum to 100
+
+| Sl No | Excel Parameter | Category | Max Score | Options | DB row | API field |
+|---|---|---|---|---|---|---|
+| 1 | Age of Subscriber/Guarantor | QUANTITATIVE | 5 | 7 | `scorecard_parameter_master (profile_type='SALARIED', sl_no='1')` | `responses[].parameterId` → this row's `id` |
+| 2 | Occupation | QUANTITATIVE | 8 | 14 | sl_no='2' | " |
+| 3 | No. of Years of Confirmed/Regular Service | QUANTITATIVE | 5 | 7 | sl_no='3' | " |
+| 4 | Annual Income as per ITR/Form No.16 | QUANTITATIVE | 5 | 8 | sl_no='4' | " |
+| 5 | Monthly Chit Subscription to Net Income | QUANTITATIVE | 20 (highest weight) | 6 | sl_no='5' | " |
+| 6 | Other Income to Total Assessed/Approved Income | QUANTITATIVE | 5 | 5 | sl_no='6' | " |
+| 7 | Market Value of Self-Owned Property to Future Liability | QUANTITATIVE | 10 | 7 | sl_no='7' | " |
+| 8 | CIBIL Score | QUANTITATIVE | 13 | 6 | sl_no='8' | drives `cibilComplete` (Section 5.4) |
+| 9 | Unexpired Chit Period | QUANTITATIVE | 8 | 4 | sl_no='9' | " |
+| 10 | Track Record of Subscription Payment | QUANTITATIVE | 8 | 6 | sl_no='10' | " |
+| 11 | Cheque Returns | QUANTITATIVE | 5 | 7 | sl_no='11' | " |
+| 12 | Mode of Payment of Subscription | QUANTITATIVE | 3 | 4 | sl_no='12' | " |
+| 13 | Follow-up Effort for Collection | QUANTITATIVE | 5 | 2 | sl_no='13' | " |
+| a | Politically influenced | QUALITATIVE | −100 | flag | sl_no='a' | `responses[].qualitativeFlag` |
+| b | Constitutional position | QUALITATIVE | −100 | flag | sl_no='b' | " |
+| c | Police Department | QUALITATIVE | −100 | flag | sl_no='c' | " |
+| d | Lawyer/advocate | QUALITATIVE | −50 | flag | sl_no='d' | " |
+| e | Trouble shooter/Litigant | QUALITATIVE | −80 | flag | sl_no='e' | " |
+| f | Critical illness | QUALITATIVE | −50 | flag | sl_no='f' | " |
+| g | Recently hospitalized/not attending to office | QUALITATIVE | −50 | flag | sl_no='g' | " |
+
+### 19.2 BUSINESS (Business sheet) — 14 QUANTITATIVE + 7 QUALITATIVE, max scores sum to 100
+
+Differs from SALARIED in several bands (Age max 3 not 5, different age-band
+boundaries; Occupation max 3 with only 5 options not 14) and adds one parameter with
+no SALARIED counterpart at all ("Sales growth in past 3 years").
+
+| Sl No | Excel Parameter | Category | Max Score | Options | DB row | API field |
+|---|---|---|---|---|---|---|
+| 1 | Age of Subscriber/Guarantor | QUANTITATIVE | 3 | 7 | `scorecard_parameter_master (profile_type='BUSINESS', sl_no='1')` | `responses[].parameterId` → this row's `id` |
+| 2 | Occupation | QUANTITATIVE | 3 | 5 | sl_no='2' | " |
+| 3 | No. of Years in Business | QUANTITATIVE | 5 | 7 | sl_no='3' | " |
+| 4 | Sales growth in past 3 years (BUSINESS-only) | QUANTITATIVE | 5 | 4 | sl_no='4' | " |
+| 5 | Annual Income as per ITR | QUANTITATIVE | 5 | 8 | sl_no='5' | " |
+| 6 | Monthly Chit Subscription to Net Income | QUANTITATIVE | 22 (highest weight) | 6 | sl_no='6' | " |
+| 7 | Other Income to Total Assessed/Approved Income | QUANTITATIVE | 5 | 5 | sl_no='7' | " |
+| 8 | Market Value of Self-Owned Property to Future Liability | QUANTITATIVE | 10 | 7 | sl_no='8' | " |
+| 9 | CIBIL Score | QUANTITATIVE | 13 | 6 | sl_no='9' | drives `cibilComplete` (Section 5.4) |
+| 10 | Unexpired Chit Period | QUANTITATIVE | 8 | 4 | sl_no='10' | " |
+| 11 | Track Record of Subscription Payment | QUANTITATIVE | 8 | 6 | sl_no='11' | " |
+| 12 | Cheque Returns | QUANTITATIVE | 5 | 7 | sl_no='12' | " |
+| 13 | Mode of Payment of Subscription (Cash weightage 0.9, vs 0.7 for SALARIED) | QUANTITATIVE | 3 | 4 | sl_no='13' | " |
+| 14 | Follow-up Effort for Collection | QUANTITATIVE | 5 | 2 | sl_no='14' | " |
+| a–g | Same 7 QUALITATIVE flags as SALARIED (item 'g' wording: "...not attending to office **or business**") | QUALITATIVE | −100/−100/−100/−50/−80/−50/−50 | flag | sl_no='a'..'g' | `responses[].qualitativeFlag` |
+
+### 19.3 Verification method
+
+Extraction was done via two `openpyxl` passes (`data_only=False` for formulas,
+`data_only=True` for the Excel's own cached values), reading Data Validation
+dropdown-list ranges (`ws.data_validations.dataValidation`) as the authoritative
+option source per parameter, and cross-checking every one of the 27 parameters'
+example-selected option against the workbook's own cached `VLOOKUP` result — 100%
+match, zero discrepancies, before any SQL was generated.
+
+---
+
+## 20. Open Questions
 
 | # | Item | Type | Detail |
 |---|---|---|---|
-| 1 | `UNDER_REVIEW` status | Assumption | Modelled in the schema and guards for forward-compatibility; no v1 endpoint transitions a card into it. If a "Start Review" action is wanted (e.g. to lock a card from further BI edits the moment FC opens it), it is a small, additive change. |
-| 2 | Only the first guarantor feeds Guarantor Quality | Assumption — **needs Credit Policy confirmation** | If multiple guarantors are onboarded, only `guarantors[0]` affects the score. Confirm whether all guarantors should be averaged, the best/worst should be used, or the current single-guarantor behaviour is correct. |
-| 3 | `auditView` is ADMIN-only | Confirmed-as-is | Mirrors the live `roles-permissions.json` exactly. If Compliance/FC should also see audit logs in production, that is a one-line change to the permission matrix, not an architectural one — flagged for the Client to confirm. |
-| 4 | Score card ↔ main LOS case linkage | Assumption | This service tracks `applicationId` as a plain string key; it does not call back into the main LOS's `WorkflowEngine` itself. The orchestrating layer (or an event/webhook, not yet built) is expected to advance the main case's status once `/submit` or `/approve` succeeds here — see Section 11. |
-| 5 | Schema migrations beyond v1 | Assumption | `db/schema.sql` is a single baseline; adopt a migration tool before the first post-launch schema change. |
+| 1 | No eligibility/pass-fail threshold | **Needs Credit Policy decision** | `Credit Score.xlsx` computes a Total Final Score per person but defines **no** cutoff, band, or decision text on it anywhere in either sheet. This service therefore returns the computed totals only (`Person.totalScore`/`totalFinalScore`) and makes no eligible/not-eligible determination. If one is wanted, it needs to be specified (e.g. a threshold on the subscriber's score, or some combination across subscriber+guarantors) — the Excel gives no guidance on combining multiple people's scores into one case-level decision either. |
+| 2 | `UNDER_REVIEW` status | Assumption | Modelled in the schema and guards for forward-compatibility; no v1 endpoint transitions a card into it. |
+| 3 | `auditView` is ADMIN-only | Confirmed-as-is | Mirrors the live `roles-permissions.json` exactly. |
+| 4 | Score card ↔ main LOS case linkage | Assumption | This service tracks `applicationId` as a plain string key; it does not call back into the main LOS's `WorkflowEngine` itself. |
+| 5 | Schema migrations beyond v1 | Assumption | `db/schema.sql` + `db/seed_credit_score.sql` are a single baseline; adopt a migration tool before the first post-launch schema change. |
 | 6 | Document upload is reference-only | Confirmed-as-is | This API never receives raw file bytes — see Section 12. |
-| 7 | CIBIL Score factor formula (Section 5.2.1) | **Confirmed** | Linear scale across 300–900 checks out exactly against the one available reference example (748 → 14.93 ≈ 15/20). |
-| 8 | Income-EMI Coverage bands (Section 5.2.2) | **Needs Credit Policy confirmation** | FOIR band thresholds (30/45/60/75/95%) and point values are an engineering default, reusing the shape of a FOIR table seen in an earlier scoring model — not verified against this 6-factor model's actual reference numbers. |
-| 9 | Security Coverage / LTV bands (Section 5.2.3) | **Needs Credit Policy confirmation** | Coverage-ratio thresholds (40/60/80/100/125%) and point values are an engineering default. |
-| 10 | DPD History bands (Section 5.2.4) | **Needs Credit Policy confirmation** | Days-past-due thresholds (29/59/89) and point values are an engineering default; confirm against the Client's actual delinquency-bucket policy. |
-| 11 | Enquiry Count bands (Section 5.2.5) | **Needs Credit Policy confirmation** | Enquiry-count thresholds (2/4/6) and point values are an engineering default. |
-| 12 | Guarantor Quality formula (Section 5.2.6) | **Needs Credit Policy confirmation** | The 6-point CIBIL / 4-point income split, and the income-ratio bands (0.5/1.0/1.5×), are an engineering default; the "no guarantor → neutral 10" rule should also be confirmed as intended (vs. e.g. a lower default when a guarantor was expected but not provided). |
-| 13 | Decision thresholds — 75 / 60 (Section 5.3) | **Needs Credit Policy confirmation** | Matches the one reference example available ("Score above threshold (75). Eligible for approval."), but the 60-74 "Conditional" band's existence and exact boundary were not independently confirmed. |
-| 14 | `proposedEmi` source | Assumption | Expected to be computed elsewhere (loan amount, tenure, interest rate) and passed in — this service does not compute an EMI from principal/tenure/rate itself. |
+| 7 | CIBIL Score is a band dropdown, not a raw bureau number | Confirmed-as-is (Excel-defined) | The Excel models "CIBIL Score" as a 6-option band dropdown ("750 and above" ... "Less than 600" ... "Not rated"), not a raw 300–900 number — the caller selects the band based on the bureau report, rather than this service computing a linear score from a raw value as the old 6-factor model did. |
+| 8 | `security_type_master.ltv_cap` | Confirmed-as-is | Informational/dropdown display only, unrelated to the Credit Score matrix or the Accepted Value Formula — unchanged by this update. |

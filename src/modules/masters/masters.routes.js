@@ -17,30 +17,19 @@ router.get('/security-types', controller.securityTypes);
 
 /**
  * @openapi
- * /masters/score-bands:
+ * /masters/credit-score-parameters:
  *   get:
- *     summary: Get Dropdown Masters — CAM Risk Score Bands
+ *     summary: Get Credit Score Card parameter + option matrix for a profile (SALARIED or BUSINESS), sourced from Credit Score.xlsx
  *     tags: [Masters]
+ *     parameters:
+ *       - in: query
+ *         name: profileType
+ *         required: true
+ *         schema:
+ *           type: string
+ *           enum: [SALARIED, BUSINESS]
  */
-router.get('/score-bands', controller.scoreBands);
-
-/**
- * @openapi
- * /masters/employment-types:
- *   get:
- *     summary: Get Dropdown Masters — Employment Types
- *     tags: [Masters]
- */
-router.get('/employment-types', controller.employmentTypes);
-
-/**
- * @openapi
- * /masters/entity-types:
- *   get:
- *     summary: Get Dropdown Masters — Business Entity Types
- *     tags: [Masters]
- */
-router.get('/entity-types', controller.entityTypes);
+router.get('/credit-score-parameters', controller.creditScoreParameters);
 
 /**
  * @openapi
